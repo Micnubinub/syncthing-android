@@ -1,0 +1,1 @@
+Wrapper cho Syncthing - Đồng bộ hoá tệp phi tập trung và mở

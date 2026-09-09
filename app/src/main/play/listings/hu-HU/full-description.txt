@@ -1,0 +1,38 @@
+Ez a Syncthing-Android wrapper forkja a Syncthing számára, amely jelentős fejlesztéseket hordoz, mint például:
+* A mappa, az eszköz és a teljes szinkronizálás folyamata könnyen leolvasható a felhasználói felületről.
+* "Syncthing Camera" - egy opcionális funkció (engedély szükséges a kamera használatához), ahol fényképeket készíthetsz barátaiddal, partnereddel, ... két telefonnal egyetlen közös és privát Syncthing mappába. Felhőben tárolásra nincs szükség hozzá. - A FUNKCIÓ JELENLEG BÉTA ÁLLAPOTBAN VAN -
+* "Óránkénti szinkronizálás", hogy még több akkumulátorhasználatot takarítson meg
+* Egyedi szinkronizálási feltételek állíthatók be eszközönként és mappánként.
+* Legutóbbi változások a felhasználói felületben - kattintson a fájlok megnyitásához.
+* A mappák és eszközök konfigurációjának módosítása attól függetlenül elvégezhető, hogy a Syncthing fut-e vagy sem.
+* A felhasználói felület megmagyarázza, hogy a szinkronizálás miért fut vagy miért nem.
+* Az "akkumulátor-evő" probléma javítva.
+* Felfedezhet más Syncthing eszközöket ugyanazon a hálózaton, és könnyen hozzáadhatja őket.
+* Támogatja a kétirányú szinkronizálást külső SD-kártyán az Android 11 óta.
+
+A Syncthing for Android egy wrapper a Syncthing számára, amely Android felhasználói felületet biztosít a Syncthing beépített webes felhasználói felülete helyett. A Syncthing a jogvédett szinkronizálási és felhőszolgáltatásokat nyílt, megbízható és decentralizált megoldással váltja fel. Az Ön adatai csakis az Ön adatai, joga van megválasztani, hogy hol tárolja őket, megosztja-e valamilyen harmadik féllel, és hogyan továbbítja az interneten keresztül.
+
+A fork céljai:
+* A fejlesztések és azok kipróbálása a közösséggel együttműködve.
+* A wrapper gyakoribb kiadása a Syncthing almodul változásai által okozott hibák azonosítása és javítása érdekében.
+* A fejlesztéseket konfigurálhatóvá kell tenni a felhasználói felületen, a felhasználó számára ezeknek be- és kikapcsolhatónak kell lenniük.
+
+Összehasonlítás a fő fejlesztés és a fork között a jelen írás idején:
+* Mindkettő a GitHub-on található hivatalos forrásból épített Syncthing bináris változatot tartalmazza.
+* A szinkronizálás funkcionalitása és megbízhatósága a Syncthing bináris almodul verziójától függ.
+* A fork jól kijön a fő fejlesztési iránnyal, és néha ők is átveszik az én fejlesztéseimet.
+* A stratégia és a kiadási gyakoriság eltérő
+* A fork csak az Android felhasználói felületet tartalmazó wrappert szólítja meg.
+
+Weboldal: https://github.com/researchxxl/syncthing-android
+
+Forráskód: https://github.com/researchxxl/syncthing-android
+
+Hogyan ír a Syncthing külső SD-kártyára: https://github.com/researchxxl/syncthing-android/blob/master/wiki/SD-card-write-access.md
+
+Wiki, FAQ és hasznos leírások: https://github.com/researchxxl/syncthing-android/tree/main/wiki#readme
+
+Hibajelentés: https://github.com/researchxxl/syncthing-android/issues
+
+Kérem, segítsen
+Fordítás: https://hosted.weblate.org/projects/syncthing-fork/app/

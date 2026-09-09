@@ -1,0 +1,40 @@
+# generated files/folders
+*.DS_Store
+*.aab
+*.aar
+*.ap_
+*.apk
+*.class
+*.dex
+*.keystore
+*.lnk
+.agents
+.android/
+.artifacts
+.codex
+.gradle/
+.kotlin/
+.opencode
+app/build/
+app/release/
+app/src/main/jniLibs
+build/
+ext/
+gradle/gradle-daemon-jvm.properties
+gradle/wrapper/gradle/
+gradle/wrapper/gradlew*
+graphify-out/
+keys.json
+outputs/
+prereq/
+scripts/debug/win/*.xml
+
+# Local configuration file (sdk path, etc)
+local.properties
+project.properties
+
+# IDE
+*.iml
+*.ipr
+*.iws
+.idea/

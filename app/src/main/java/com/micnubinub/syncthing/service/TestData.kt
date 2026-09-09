@@ -1,0 +1,11 @@
+package com.micnubinub.syncthing.service
+
+/**
+ * Test data used if Constants.ENABLE_TEST_DATA == true.
+ */
+object TestData {
+    const val DEVICE_A_ID: String =
+        "ZOK75WR-W3XWWUZ-NNLXV7V-DUYKVWA-SSPD7OH-3QYOZBY-SBH3N2Y-IAVJ4QH"
+    const val DEVICE_B_ID: String =
+        "ZPUZOWC-SUCJILE-ITNLBLL-MHBWJG5-46QM47Y-CDTQT3M-IA4RSJV-7BYA7QA"
+}

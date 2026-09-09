@@ -1,0 +1,280 @@
+name: Build App
+
+permissions:
+  contents: write
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_call:
+    inputs:
+      applicationId:
+        description: "Application ID"
+        required: false
+        type: string
+      buildType:
+        description: "Gradle build type"
+        required: true
+        type: string
+      checkoutRef:
+        description: "Git ref"
+        required: false
+        type: string
+      gradleOptions:
+        description: "Gradle options"
+        required: false
+        type: string
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash -euo pipefail {0}
+
+jobs:
+  build:
+    name: Build ${{ inputs.buildType || 'Release' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    if: github.actor == github.repository_owner
+    env:
+      BUILD_TYPE: ${{ inputs.buildType || 'Release' }}
+      PREBUILT_DIR: /opt/syncthing-android-prereq/prebuilt-jnilibs
+      GRADLE_OPTIONS: ${{ inputs.gradleOptions }}
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: true
+          fetch-depth: 0
+          ref: ${{ inputs.checkoutRef }}
+
+      - name: Override applicationId
+        if: inputs.applicationId != ''
+        env:
+          APP_ID: ${{ inputs.applicationId }}
+        run: |
+          echo "Overriding applicationId with: ${APP_ID}"
+          sed -i "s|applicationId = \".*\"|applicationId = \"${APP_ID}\"|" app/build.gradle.kts
+          grep -q "applicationId = \"${APP_ID}\"" app/build.gradle.kts
+
+      - name: Read versions from gradle catalog
+        id: versions
+        run: |
+          TOML=gradle/libs.versions.toml
+          get() { grep -m1 "^$1 = " "$TOML" | cut -d '"' -f 2; }
+          NDK_VERSION="$(get ndk-version)"
+          GO_VERSION="$(get go_version)"
+          APP_VERSION="$(get version-name)"
+          for v in NDK_VERSION GO_VERSION APP_VERSION; do
+            [ -n "${!v}" ] || { echo "::error::$v not found in $TOML"; exit 1; }
+          done
+          {
+            echo "ndk=${NDK_VERSION}"
+            echo "go=${GO_VERSION}"
+            echo "app=${APP_VERSION}"
+          } >> "$GITHUB_OUTPUT"
+          echo "GO_VERSION=${GO_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ steps.versions.outputs.go }}
+          cache: false
+
+      - name: Cache Go modules
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go${{ steps.versions.outputs.go }}-${{ hashFiles('syncthing/src/github.com/syncthing/syncthing/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go${{ steps.versions.outputs.go }}-
+
+      - name: Set Gradle and Android user home
+        run: |
+          echo "GRADLE_USER_HOME=${RUNNER_TEMP}/.gradle" >> "$GITHUB_ENV"
+          echo "ANDROID_USER_HOME=${RUNNER_TEMP}/.android" >> "$GITHUB_ENV"
+          mkdir -p "${RUNNER_TEMP}/.gradle" "${RUNNER_TEMP}/.android"
+
+      - name: Cache Gradle and Android user home
+        uses: actions/cache@v6
+        with:
+          path: |
+            ${{ runner.temp }}/.gradle/caches
+            ${{ runner.temp }}/.gradle/wrapper
+            ${{ runner.temp }}/.android
+          key: ${{ runner.os }}-gradle-android-${{ env.BUILD_TYPE }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties', '**/libs.versions.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-android-${{ env.BUILD_TYPE }}-
+            ${{ runner.os }}-gradle-android-
+
+      - name: Install syncthing
+        run: go run scripts/installSyncthing.go
+
+      - name: Get syncthing commit hash
+        id: syncthing
+        run: |
+          cd syncthing/src/github.com/syncthing/syncthing
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "tag=$(git describe --always)" >> "$GITHUB_OUTPUT"
+          echo "SYNCTHING_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Prepare prebuilt native libraries directory
+        run: |
+          sudo mkdir -p "$PREBUILT_DIR"
+          sudo chown -R "$(id -u):$(id -g)" /opt/syncthing-android-prereq
+
+      - name: Cache prebuilt native libraries
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.PREBUILT_DIR }}
+          key: ${{ runner.os }}-prebuilt-jnilibs-go${{ steps.versions.outputs.go }}-ndk${{ steps.versions.outputs.ndk }}-${{ steps.syncthing.outputs.tag }}-${{ steps.syncthing.outputs.commit }}
+
+      - name: Cache Android SDK
+        uses: actions/cache@v6
+        with:
+          path: ~/android-sdk
+          key: android-sdk-${{ runner.os }}-ndk${{ steps.versions.outputs.ndk }}
+
+      - name: Set up Android SDK and NDK
+        run: |
+          export ANDROID_HOME="$HOME/android-sdk"
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
+          mkdir -p "$ANDROID_HOME"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          go run scripts/initDevEnv.go --tools-dir="$ANDROID_HOME"
+
+      - name: Check native libraries cache
+        run: |
+          if [ -d "$PREBUILT_DIR/$SYNCTHING_COMMIT" ]; then
+            echo "Found cached native libraries for $SYNCTHING_COMMIT"
+          else
+            echo "No cached native libraries for $SYNCTHING_COMMIT - building from scratch"
+          fi
+
+      - name: Build app
+        run: |
+          unset ANDROID_NDK_HOME
+          git config --global --add safe.directory '*'
+          # shellcheck disable=SC2086
+          ./gradlew --no-daemon --stacktrace buildNative "assemble${BUILD_TYPE}" ${GRADLE_OPTIONS}
+
+      - name: Save prebuilt native libraries to cache
+        run: |
+          if [ -d app/src/main/jniLibs ]; then
+            rm -rf "$PREBUILT_DIR/$SYNCTHING_COMMIT"
+            mkdir -p "$PREBUILT_DIR/$SYNCTHING_COMMIT"
+            cp -r app/src/main/jniLibs/. "$PREBUILT_DIR/$SYNCTHING_COMMIT/"
+            echo "Saved native libraries for $SYNCTHING_COMMIT"
+          else
+            echo "No native libraries found to cache"
+          fi
+
+      - name: Rename APKs
+        env:
+          VERSION: ${{ steps.versions.outputs.app }}
+        run: |
+          shopt -s nullglob
+          cd app/build/outputs/apk
+          FOUND=0
+          for APK in */*.apk; do
+            FOUND=1
+            DIR="$(dirname -- "$APK")"
+            NAME="$(basename -- "$APK" .apk)"
+            # app-<abi>-<buildtype>[-unsigned] -> <abi>
+            NAME="${NAME#app-}"
+            NAME="${NAME%-unsigned}"
+            ABI="${NAME%-*}"
+            if [ "$ABI" = "universal" ] || [ "$ABI" = "$NAME" ]; then
+              TARGET="Syncthing-${VERSION}.apk"
+            else
+              TARGET="Syncthing-${VERSION}_${ABI}.apk"
+            fi
+            echo "Renaming $APK -> $DIR/$TARGET"
+            mv -n -- "$APK" "$DIR/$TARGET"
+          done
+          [ "$FOUND" -eq 1 ] || { echo "::error::No APKs produced"; exit 1; }
+          ls -la ./*/
+
+      - name: Upload unsigned artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: unsigned-apks
+          retention-days: 1
+          path: app/build/outputs/apk/*/*.apk
+          if-no-files-found: error
+
+      - name: Sign APKs with debug keystore
+        env:
+          KS_PASS: android
+        run: |
+          shopt -s nullglob
+          APKSIGNER="$(ls -d "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -n1)"
+          [ -x "$APKSIGNER" ] || { echo "::error::apksigner not found"; exit 1; }
+
+          KS="${RUNNER_TEMP}/keystore"
+          trap 'rm -f "$KS"' EXIT
+          echo "Generating UNTRUSTED PUBLIC debug keystore"
+          keytool -genkeypair \
+            -alias androiddebugkey \
+            -keyalg RSA -keysize 2048 \
+            -validity 9999 \
+            -storetype PKCS12 \
+            -keystore "$KS" \
+            -storepass "$KS_PASS" \
+            -keypass "$KS_PASS" \
+            -dname "CN=Android Debug,O=Android,C=US"
+
+          mkdir -p dist
+          APKS=(app/build/outputs/apk/*/*.apk)
+          [ ${#APKS[@]} -gt 0 ] || { echo "::error::No APKs found"; exit 1; }
+
+          for UNSIGNED in "${APKS[@]}"; do
+            OUT="dist/$(basename -- "$UNSIGNED")"
+            echo "Signing $UNSIGNED -> $OUT"
+            "$APKSIGNER" sign \
+              --ks "$KS" \
+              --ks-pass env:KS_PASS \
+              --key-pass env:KS_PASS \
+              --ks-key-alias androiddebugkey \
+              --out "$OUT" "$UNSIGNED"
+            "$APKSIGNER" verify --print-certs "$OUT"
+          done
+          ls -la dist
+
+      - name: Upload signed APKs
+        uses: actions/upload-artifact@v7
+        with:
+          name: signed-apks
+          path: dist/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.apk
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+
+      - name: Build reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-reports
+          path: app/build/reports/**
+          if-no-files-found: ignore

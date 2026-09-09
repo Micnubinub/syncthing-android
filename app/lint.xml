@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<lint>
+    <issue id="ObsoleteLintCustomCheck" severity="ignore" />
+    <!-- We don't care about incomplete translations. -->
+    <issue id="MissingTranslation" severity="ignore" />
+    <!-- Ignore notices about updating gradle dependencies -->
+    <issue id="AndroidGradlePluginVersion" severity="ignore" />
+    <issue id="GradleDependency" severity="ignore" />
+    <!-- Ignore "Value overridden by Gradle build script" for app
+    version (which is actually read from manifest by gradle). -->
+    <issue id="GradleOverrides" severity="ignore" />
+    <!-- Some attributes aren't used on older Android versions,
+    but we don't care or use alternative attributes for these
+    platforms -->
+    <issue id="UnusedAttribute" severity="ignore" />
+    <issue id="ProtectedPermissions" severity="ignore" />
+    <!-- Disabling battery optimizations is optional, so this warning doesn't apply to us -->
+    <issue id="BatteryLife" severity="ignore" />
+    <!-- Disable warning about scoped storage policies -->
+    <issue id="ScopedStorage" severity="ignore" />
+    <!-- Disable notice about custom x509 certificate trust manager -->
+    <issue id="CustomX509TrustManager" severity="ignore" />
+    <!-- Ignore types in translations (not handled by us) -->
+    <issue id="Typos">
+        <ignore path="src/main/res/values" />
+        <ignore path="src/main/res/values-ar" />
+        <ignore path="src/main/res/values-cs" />
+        <ignore path="src/main/res/values-da" />
+        <ignore path="src/main/res/values-da-rDK" />
+        <ignore path="src/main/res/values-de" />
+        <ignore path="src/main/res/values-el" />
+        <ignore path="src/main/res/values-es" />
+        <ignore path="src/main/res/values-fi" />
+        <ignore path="src/main/res/values-fr" />
+        <ignore path="src/main/res/values-fr-rFR" />
+        <ignore path="src/main/res/values-hu" />
+        <ignore path="src/main/res/values-in" />
+        <ignore path="src/main/res/values-it" />
+        <ignore path="src/main/res/values-ja" />
+        <ignore path="src/main/res/values-ko" />
+        <ignore path="src/main/res/values-nb" />
+        <ignore path="src/main/res/values-nl" />
+        <ignore path="src/main/res/values-pl" />
+        <ignore path="src/main/res/values-pl-rPL" />
+        <ignore path="src/main/res/values-pt" />
+        <ignore path="src/main/res/values-pt-rBR" />
+        <ignore path="src/main/res/values-ru" />
+        <ignore path="src/main/res/values-sk" />
+        <ignore path="src/main/res/values-sl" />
+        <ignore path="src/main/res/values-sr" />
+        <ignore path="src/main/res/values-sv" />
+        <ignore path="src/main/res/values-tr" />
+        <ignore path="src/main/res/values-zh-rCN" />
+        <ignore path="src/main/res/values-zh-rTW" />
+    </issue>
+    <!-- Ignore lint on ... not being replaced by the ellipsis character -->
+    <issue id="TypographyEllipsis" severity="ignore" />
+    <!-- Don't fail lint on translation errors, they have to be resolved on Weblate -->
+    <issue id="MissingQuantity" severity="warning">
+        <ignore path="src/main/res/values-cs" />
+        <ignore path="src/main/res/values-iw" />
+        <ignore path="src/main/res/values-fr" />
+    </issue>
+    <issue id="ImpliedQuantity" severity="warning">
+        <ignore path="src/main/res/values-fr" />
+        <ignore path="src/main/res/values-pt-rBR" />
+        <ignore path="src/main/res/values-ru" />
+        <ignore path="src/main/res/values-uk" />
+    </issue>
+    <!-- Don't fail lint on unused translations because they don't hurt -->
+    <issue id="UnusedQuantity" severity="ignore">
+        <ignore path="src/main/res/values-cs" />
+    </issue>
+    <!-- Having an expandable drawer for the menu will always cause overdrawing regions -->
+    <issue id="Overdraw">
+        <ignore path="src/main/res/layout/widget_toolbar.xml" />
+    </issue>
+    <issue id="OldTargetApi" severity="ignore" />
+    <!-- Temporary ignored until it's time to fix them -->
+    <issue id="Overdraw" severity="ignore" />
+    <issue id="PrivateResource" severity="ignore" />
+    <issue id="RelativeOverlap">
+        <ignore path="src/main/res/layout/activity_first_start.xml" />
+        <ignore path="src/main/res/layout/activity_photo_shoot_intro.xml" />
+    </issue>
+    <!-- Ignore unused drawables -->
+    <issue id="UnusedResources" severity="ignore">
+        <ignore path="src/main/res/drawable-ldpi" />
+        <ignore path="src/main/res/drawable-hdpi" />
+        <ignore path="src/main/res/drawable-xhdpi" />
+        <ignore path="src/main/res/drawable-xxhdpi" />
+        <ignore path="src/main/res/drawable-xxxhdpi" />
+    </issue>
+    <!-- Ignore long vector paths -->
+    <issue id="VectorPath" severity="ignore" />
+    <!-- Skip proceed onReceivedSslError -->
+    <issue id="WebViewClientOnReceivedSslError" severity="ignore">
+        <ignore path="src/main/java/com/nutomic/syncthingandroid/activities/WebViewActivity.java" />
+    </issue>
+</lint>

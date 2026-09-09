@@ -1,0 +1,38 @@
+これは Syncthing-Android ラッパーのフォークです。以下のような大きな機能強化をもたらします：
+* フォルダやデバイス、全体的な同期の進行状況が簡単に分かります。
+* "Syncthing Camera" - 友人やパートナー、など、2台の携帯電話で1つの共有したり、プライベートなSyncthingフォルダに写真を撮ることができるオプション機能（カメラの使用許可をオプションで取得）。クラウドは関係ありません。- 現在ベータ段階にある機能です -
+* "Sync every hour"(1時間ごとに同期) でさらにバッテリーを節約
+* デバイスごとやフォルダごとに個別の同期条件を適用可能です。
+* 最近のUI変更点UIは、クリックするとファイルが開くようになりました。
+* Syncthing が起動しているかどうかに関わらず、フォルダやデバイスの設定を変更することができます。
+* 同期が実行されているかどうかはUIで明確です。
+* バッテリー消費が多い問題を修正しました。
+* 同じネットワーク上の他の Syncthing デバイスを発見し、簡単に追加することができます。
+* Supports two-way synchronization on external SD card since Android 11.
+
+Syncthing for Android は Syncthing のラッパーで、Syncthing に内蔵されている Web UI の代わりに Android UI を提供します。Syncthing は、プロプライエタリな同期サービスやクラウドサービスを、オープンで信頼性が高く、分散化されたものに置き換えます。あなたのデータはあなただけのものであり、どこに保存するか、第三者と共有するか、インターネットを介してどのように転送するかを選択する権利があります。
+
+以下がこのこのフォークアプリのゴールです：
+* コミュニティと一緒に機能拡張を開発し、試してみること
+* Syncthing のサブモジュールの変更に起因するバグを特定し、修正するために、ラッパーをより頻繁にリリースする。
+* UIで機能拡張を設定可能にし、ユーザーはそれらをオン/オフできるようにする。
+
+これを書いている時点でのオリジナルとフォークの比較: 
+* Both contain the syncthing binary built from the official source at GitHub
+* 同期機能と信頼性は、Syncthing バイナリのサブモジュールのバージョンに依存します。
+* フォークは上流と仲良くしていて、たまに改善点を拾ってくれることもあります。
+* 戦略とリリース頻度が異なります。
+* Android UIを含むラッパーのみがフォークで指定されるものです。
+
+Webサイト: https://github.com/researchxxl/syncthing-android
+
+ソースコード: https://github.com/researchxxl/syncthing-android
+
+Syncthingに外部SDカード書き込み許可を与える方法：  https://github.com/researchxxl/syncthing-android/blob/master/wiki/SD-card-write-access.md
+
+Wiki, FAQ, 役立つ記事: https://github.com/researchxxl/syncthing-android/tree/main/wiki#readme
+
+問題: https://github.com/researchxxl/syncthing-android/issues
+
+一緒に手伝って下さい：
+翻訳： https://hosted.weblate.org/projects/syncthing-fork/app/

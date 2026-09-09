@@ -1,0 +1,20 @@
+Major update: Kotlin rewrite and modernization
+
+Modernization
+- Codebase rewritten from Java to Kotlin
+- Replaced threads and runnables with coroutines and Flow
+- Replaced LocalBroadcastManager with SharedFlow
+- Updated to Material 3 icons
+
+Dependencies
+- Volley replaced with OkHttp
+- jBCrypt replaced with at.favre.lib:bcrypt
+
+Build & Tooling
+- Python build scripts replaced with Go
+- ProGuard/R8 enabled with minification and resource shrinking
+- minSdk raised to 24, targetSdk raised to 37
+
+Other
+- Cleaned up deprecated APIs
+- CI: reusable workflows and automated run cleanup

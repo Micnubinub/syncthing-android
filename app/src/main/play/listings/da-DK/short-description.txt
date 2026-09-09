@@ -1,0 +1,1 @@
+Wrapper til Syncthing - Åben og decentraliseret filsynkronisering

@@ -1,0 +1,42 @@
+name: "Recycle Runs"
+
+on:
+  schedule:
+    - cron: "0 19 1 * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+env:
+  GO_VERSION: "1.27.1"
+
+jobs:
+  recycle-workflow-runs:
+    runs-on: ubuntu-24.04
+    if: github.repository_owner == 'micnubinub'
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: .github/scripts
+          fetch-depth: 1
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Run workflow cleanup
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: go run .github/scripts/recycle-workflow-runs.go

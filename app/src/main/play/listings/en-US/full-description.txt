@@ -1,0 +1,48 @@
+Syncthing for Android is a native Android app for Syncthing that replaces the built-in Web UI with a proper Android interface. Syncthing replaces proprietary sync and cloud services with something open, trustworthy and decentralized. Your data is your data alone. You decide where it is stored, whether it is shared with any third party and how it is transmitted over the Internet.
+
+This is a fork of `researchxxl/syncthing-android` (itself forked from the official syncthing-android), created because the official app stopped receiving Play Store updates. The goal is to modernize the codebase, slim it down and keep it maintained.
+
+WHAT'S DIFFERENT IN THIS FORK
+
+Modernized codebase
+* Entire codebase converted from Java to Kotlin
+* Threads and runnables replaced with coroutines
+* Legacy broadcasts replaced with modern network callbacks and flows
+* Deprecated Android APIs cleaned up
+* Material 3 icons and refreshed drawables
+
+Smaller and faster
+* R8 minification, resource shrinking and log stripping (roughly half the previous app size)
+* Per-ABI APK splits, so you only download the native code your device needs
+* Volley replaced with OkHttp, plus updated crypto and lifecycle libraries
+
+Features
+* Folder, device and overall sync progress visible directly in the UI
+* Individual run conditions per device and per folder
+* QR code scanning for adding devices
+* Runs Syncthing as a background service with battery and network aware conditions
+
+Requirements
+* Android 7.0 (API 24) or newer
+
+SWITCHING FROM THE OFFICIAL APP
+
+Switching is easier than you might think. A step-by-step migration guide is available in the wiki.
+
+KNOWN LIMITATIONS
+* Not yet available on F-Droid
+* Not yet on Weblate for community translations
+
+A lot has changed under the hood, so you may run into issues. Reported problems are fixed as quickly as possible. Please seek help on the Syncthing forum and/or social media first before creating issues on the tracker.
+
+Source code: https://github.com/Micnubinub/syncthing-android
+
+Wiki, FAQ and guides: https://github.com/Micnubinub/syncthing-android/tree/main/wiki#readme
+
+Migration guide: https://github.com/Micnubinub/syncthing-android/blob/main/wiki/migration/Switching-from-the-deprecated-official-version.md
+
+Issues: https://github.com/Micnubinub/syncthing-android/issues
+
+Privacy policy: https://github.com/Micnubinub/syncthing-android/blob/main/privacy-policy.md
+
+Licensed under the MPLv2. Syncthing is a trademark of the Syncthing Foundation. This app is not affiliated with the Syncthing Foundation.

@@ -1,0 +1,27 @@
+Bu, Syncthing için Syncthing-Android sarmalayıcısının bir çatalıdır ve aşağıdaki gibi önemli geliştirmeler sağlar:
+* Klasör, cihaz ve genel eşitleme ilerlemesi kullanıcı arayüzünden kolayca okunabilir.
+* Daha da fazla pil tasarrufu için "her saat eşitleyin"
+* Cihaz başına ve klasör başına ayrı eşitleme koşulları uygulanabilir
+* Son değişiklikler kullanıcı arayüzü, dosyaları açmak için tıklayın.
+* Syncthing'in çalışıp çalışmadığına bakılmaksızın klasör ve cihaz yapılandırmasında değişiklikler yapılabilir
+* Kullanıcı arayüzü eşitlemenin neden çalışıp çalışmadığını açıklar.
+* "Pili tüketme" sorunu düzeltildi.
+* Aynı ağdaki diğer Syncthing cihazlarını keşfedin ve bunları kolayca ekleyin.
+* Android 11'den bu yana harici SD kartta iki yönlü eşitlemeyi destekler.
+
+Android için Syncthing, Syncthing'in yerleşik Web Kullanıcı Arayüzü yerine bir Android Kullanıcı Arayüzü sağlayan Syncthing için bir sarmalayıcıdır. Syncthing, tescilli eşitleme ve bulut hizmetlerinin yerini açık, güvenilir ve merkezi olmayan bir şeyle değiştirir. Verileriniz yalnızca size ait verilerdir ve bunların nerede saklanacağını, üçüncü taraflarla paylaşılıp paylaşılmayacağını ve İnternet üzerinden nasıl aktarılacağını seçme hakkına sahipsiniz.
+
+Lütfen izleyicide sorun konuları oluşturmadan önce forum ve/veya sosyal medya uygulamalarında yardım isteyin. Syncthing'un aile ve arkadaşların Android'de Syncthing kullanmalarına yardımcı olmak için kişisel bir ilgi olarak doğduğunu lütfen unutmayın. Sonuçların sizinle ve toplulukla paylaşılmasına rağmen şu anda 100.000'den fazla kullanıcıyı hedeflememekte. Teşekkür ederim.
+
+Web sitesi: https://github.com/researchxxl/syncthing-android
+
+Kaynak kodu: https://github.com/researchxxl/syncthing-android
+
+Syncthing harici SD karta nasıl yazar: https://github.com/researchxxl/syncthing-android/blob/main/wiki/SD-card-write-access.md
+
+Viki, SSS ve faydalı makaleler: https://github.com/researchxxl/syncthing-android/tree/main/wiki#readme
+
+Sorunlar: https://github.com/researchxxl/syncthing-android/issues
+
+Lütfen çeviri konusunda
+yardım edin: https://hosted.weblate.org/projects/syncthing-fork/app/

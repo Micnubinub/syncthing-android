@@ -1,0 +1,27 @@
+Esto es un fork del wrapper Syncthing-Android para Syncthing que trae mejoras como:
+* Proceso general de sincronización, carpetas y dispositivos fácilmente legibles desde la interfaz.
+* «Sincronizar cada hora» para ahorrar aún más batería.
+* Condiciones individuales de sincronización para cada dispositivo y carpeta.
+* Cambios recientes en la interfaz: pulsar para abrir archivos.
+* Cambiar la configuración de las carpetas y dispositivos independientemente de si Syncthing se está ejecutando o no.
+* La interfaz explica porqué Syncthing se está ejecutando o no.
+* Problema de «drenaje de batería» solucionado.
+* Descubrir y añadir fácilmente otros dispositivos Syncthing en la misma red.
+* Soporte para la sincronización bidireccional con tarjeta SD externa desde Android 11.
+
+Syncthing para Android es un wrapper para Syncthing que provee una interfaz de Android en lugar de la interfaz web integrada de Syncthing. Syncthing reemplaza la sincronización propietaria y servicios de nube con una aplicación de código abierto, confiable y descentralizada. Tus datos son tuyos y mereces elegir dónde se almacenan, si se comparten con terceros y cómo son transmitidos por Internet.
+
+Por favor, busca ayuda en el foro y/o en las redes sociales antes de crear incidencias. Ten en cuenta que Syncthing‑Fork nació por interés personal para ayudar a familiares y amigos a usar Syncthing en Android. No fue diseñado para los más de 100.000 usuarios actuales, aunque compartimos los resultados contigo y la comunidad. Gracias.
+
+Sitio web: https://github.com/researchxxl/syncthing-android
+
+Código fuente: https://github.com/researchxxl/syncthing-android
+
+Cómo escribe Syncthing en la tarjeta SD externa: https://github.com/researchxxl/syncthing-android/blob/master/wiki/SD-card-write-access.md
+
+Wiki, Preguntas Frecuentes y artículos útiles: https://github.com/researchxxl/syncthing-android/tree/main/wiki#readme
+
+Problemas: https://github.com/researchxxl/syncthing-android/issues
+
+Por favor, ayude con la
+Traducción: https://hosted.weblate.org/projects/syncthing-fork/app/
