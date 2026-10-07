@@ -22,6 +22,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlin.time.Duration.Companion.milliseconds
 
 /**
  * Immutable snapshot of the per-folder status data the screen needs.
@@ -123,7 +124,7 @@ class FolderFragmentViewModel : ViewModel() {
                         )
                     }
                 }
-                delay(GUI_UPDATE_INTERVAL)
+                delay(GUI_UPDATE_INTERVAL.milliseconds)
             }
         }
     }
@@ -141,8 +142,8 @@ class FolderFragmentViewModel : ViewModel() {
             return emptyMap()
         }
         val statuses = HashMap<String, FolderItemStatusUi>(folders.size)
-        for (folder in folders) {
-            val folderId = folder.id ?: continue
+        for ((_, id) in folders) {
+            val folderId = id ?: continue
             statuses[folderId] = restApi.getFolderStatus(folderId).toItemStatusUi()
         }
         return statuses
@@ -173,7 +174,9 @@ class FolderFragmentViewModel : ViewModel() {
             Log.e(TAG, "rescanAll skipped because Syncthing is not running.")
             return
         }
-        restApi.rescanAll()
+        // Awaited so the request is not abandoned with this call, and so a rejection is
+        // logged where it happens instead of vanishing into the callback style.
+        viewModelScope.launch { restApi.rescanAll() }
     }
 
     fun overrideChanges(folderId: String?) {
@@ -182,7 +185,7 @@ class FolderFragmentViewModel : ViewModel() {
             Log.e(TAG, "overrideChanges skipped because Syncthing is not running.")
             return
         }
-        restApi.overrideChanges(folderId)
+        viewModelScope.launch { restApi.overrideChanges(folderId) }
     }
 
     fun revertLocalChanges(folderId: String?) {
@@ -191,7 +194,7 @@ class FolderFragmentViewModel : ViewModel() {
             Log.e(TAG, "revertLocalChanges skipped because Syncthing is not running.")
             return
         }
-        restApi.revertLocalChanges(folderId)
+        viewModelScope.launch { restApi.revertLocalChanges(folderId) }
     }
 
     companion object {

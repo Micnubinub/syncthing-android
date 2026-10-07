@@ -16,6 +16,7 @@ import com.micnubinub.syncthing.service.RunConditionBus
 import com.micnubinub.syncthing.service.RunConditionEvent
 import com.micnubinub.syncthing.service.SyncthingService
 import com.micnubinub.syncthing.util.Util
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -25,6 +26,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.util.Locale
 import java.util.concurrent.TimeUnit
+import kotlin.time.Duration.Companion.milliseconds
 
 @Stable
 data class StatusFragmentState(
@@ -76,18 +78,19 @@ class StatusActivityViewModel(application: Application) : AndroidViewModel(appli
     private fun loadData() {
         try {
             pollingJob?.cancel()
-        } catch (e: Exception) {
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            // Ignore; cancelling the previous polling job is best-effort.
         }
         val context = getApplication<Application>()
         pollingJob = viewModelScope.launch {
             api?.getRemoteDeviceStatus(null)
             while (true) {
                 api?.getSystemStatus(listener = { systemStatus ->
-                    systemStatus.let {
-                        onReceiveSystemStatus(context, systemStatus)
-                    }
+                    onReceiveSystemStatus(context, systemStatus)
                 })
-                delay(REST_UPDATE_INTERVAL)
+                delay(REST_UPDATE_INTERVAL.milliseconds)
             }
         }
     }

@@ -3,6 +3,8 @@ package com.micnubinub.syncthing.ui.viewModels
 import android.content.SharedPreferences
 import android.net.http.SslError
 import android.webkit.SslErrorHandler
+import androidx.core.content.edit
+import androidx.core.net.toUri
 import androidx.lifecycle.ViewModel
 import com.micnubinub.syncthing.service.Constants
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -57,7 +59,7 @@ class WebViewActivityViewModel : ViewModel() {
 
     /**
      * Pending SSL handler waiting for user response. Only one SSL error can be
-     * pending at a time; a new error replaces any previous unhandled one.
+     * pending at a time; a new error cancels any previous unhandled one.
      */
     private var pendingSslHandler: SslErrorHandler? = null
 
@@ -77,7 +79,7 @@ class WebViewActivityViewModel : ViewModel() {
      */
     fun sslExceptionKey(error: SslError): String {
         val host = try {
-            error.url?.let { android.net.Uri.parse(it).host }
+            error.url?.toUri()?.host
         } catch (_: Exception) {
             null
         }
@@ -106,12 +108,12 @@ class WebViewActivityViewModel : ViewModel() {
             is WebViewActivityAction.SecurityNoticeAccepted -> {
                 action.key?.let {
                     acceptedSslExceptions.add(it)
-                    preferences?.edit()
-                        ?.putStringSet(
+                    preferences?.edit {
+                        putStringSet(
                             Constants.PREF_ACCEPTED_SSL_EXCEPTIONS,
                             acceptedSslExceptions
                         )
-                        ?.apply()
+                    }
                 }
                 pendingSslHandler?.proceed()
                 pendingSslHandler = null
@@ -125,6 +127,9 @@ class WebViewActivityViewModel : ViewModel() {
             }
 
             is WebViewActivityAction.SslErrorReceived -> {
+                // The WebView holds the previous request until its handler is called, so a
+                // replacement has to cancel it rather than just drop the reference.
+                cancelPendingSsl()
                 pendingSslHandler = action.handler
                 pendingSslKey = action.key
                 _state.update { it.copy(showSecurityNotice = true) }

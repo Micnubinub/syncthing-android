@@ -11,11 +11,15 @@ import android.os.Environment
 import android.os.FileUriExposedException
 import android.os.storage.StorageManager
 import android.provider.DocumentsContract
+import android.system.ErrnoException
+import android.system.Os
+import android.system.OsConstants
 import android.util.Log
 import android.webkit.MimeTypeMap
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.core.content.FileProvider
+import androidx.core.net.toUri
 import androidx.documentfile.provider.DocumentFile
 import com.micnubinub.syncthing.R
 import com.micnubinub.syncthing.util.MimeTypes.Companion.mimeTypes
@@ -26,7 +30,6 @@ import java.io.IOException
 import java.lang.reflect.Array.get
 import java.lang.reflect.Array.getLength
 import java.nio.charset.StandardCharsets
-import java.util.Arrays
 import java.util.Locale
 
 /**
@@ -97,7 +100,7 @@ object FileUtils {
                 BufferedReader(FileReader("/proc/mounts")).use { br ->
                     while (true) {
                         val line = br.readLine() ?: break
-                        if (line.contains("/storage/") == true || line.contains("/mnt/media_rw/") == true) {
+                        if (line.contains("/storage/") || line.contains("/mnt/media_rw/")) {
                             val parts = line.split(" ".toRegex()).dropLastWhile { it.isEmpty() }
                             val mountPoint = parts[1]
 
@@ -122,7 +125,7 @@ object FileUtils {
 
     val mountedStoragePathsAsFileArray: List<File>
         get() {
-            val files: MutableList<File> = ArrayList<File>(mountedStoragePaths.size)
+            val files: MutableList<File> = ArrayList(mountedStoragePaths.size)
             for (path in mountedStoragePaths) {
                 val f = File(path)
                 if (f.canRead()) {
@@ -209,9 +212,7 @@ object FileUtils {
         when (extDirType) {
             ExternalStorageDirType.DATA -> {
                 externalFilesDir.addAll(
-                    Arrays.asList<File?>(
-                        context.getExternalFilesDir(null)
-                    )
+                    listOf(context.getExternalFilesDir(null))
                 )
                 if (externalFilesDir.size > 1) {
                     // There is a bug on Huawei devices running Android 7, which returns the wrong external path.
@@ -229,9 +230,9 @@ object FileUtils {
             )
 
             ExternalStorageDirType.EXT_MEDIA -> {
-                externalFilesDir.addAll(Arrays.asList<File>(*context.externalMediaDirs))
-                if (!externalFilesDir.isEmpty()) {
-                    externalFilesDir.remove(externalFilesDir.get(0))
+                externalFilesDir.addAll(listOf(*context.externalMediaDirs))
+                if (externalFilesDir.isNotEmpty()) {
+                    externalFilesDir.remove(externalFilesDir[0])
                 }
             }
         }
@@ -243,7 +244,7 @@ object FileUtils {
         type?.let {
             when (extDirType) {
                 ExternalStorageDirType.EXT_MEDIA, ExternalStorageDirType.INT_MEDIA -> if (type == Environment.DIRECTORY_PICTURES) {
-                    return File(externalFilesDir.get(0), Environment.DIRECTORY_PICTURES)
+                    return File(externalFilesDir[0], Environment.DIRECTORY_PICTURES)
                 }
 
                 else -> {
@@ -286,25 +287,19 @@ object FileUtils {
             val volumeId: String = segments[2]
             when (extDirType) {
                 ExternalStorageDirType.DATA ->                     // Build the content Uri for our private ".../data/[PKG_NAME]/files" folder.
-                    return Uri.parse(
-                        "content://" + EXTERNAL_STORAGE_AUTHORITY + "/document/" +
-                                volumeId + "%3AAndroid%2Fdata%2F" +
-                                context.packageName + "%2Ffiles"
-                    )
+                    return ("content://" + EXTERNAL_STORAGE_AUTHORITY + "/document/" +
+                            volumeId + "%3AAndroid%2Fdata%2F" +
+                            context.packageName + "%2Ffiles").toUri()
 
                 ExternalStorageDirType.EXT_MEDIA ->                     // Build the content Uri for our private ".../media/[PKG_NAME]" folder.
-                    return Uri.parse(
-                        "content://" + EXTERNAL_STORAGE_AUTHORITY + "/document/" +
-                                volumeId + "%3AAndroid%2Fmedia%2F" +
-                                context.packageName
-                    )
+                    return ("content://" + EXTERNAL_STORAGE_AUTHORITY + "/document/" +
+                            volumeId + "%3AAndroid%2Fmedia%2F" +
+                            context.packageName).toUri()
 
                 ExternalStorageDirType.INT_MEDIA ->                     // Build the content Uri for our private ".../media/[PKG_NAME]" folder.
-                    return Uri.parse(
-                        "content://" + EXTERNAL_STORAGE_AUTHORITY + "/document/" +
-                                "primary" + "%3AAndroid%2Fmedia%2F" +
-                                context.packageName
-                    )
+                    return ("content://" + EXTERNAL_STORAGE_AUTHORITY + "/document/" +
+                            "primary" + "%3AAndroid%2Fmedia%2F" +
+                            context.packageName).toUri()
             }
         } catch (e: Exception) {
             Log.w(TAG, "getExternalFilesDirUri exception", e)
@@ -318,7 +313,7 @@ object FileUtils {
          * to a "content://" Uri. As "file://" Uri has been blocked
          * since Android 7+, we need to build the Uri manually.
          */
-        get() = Uri.parse("content://$EXTERNAL_STORAGE_AUTHORITY/document/primary%3A")
+        get() = "content://$EXTERNAL_STORAGE_AUTHORITY/document/primary%3A".toUri()
 
     private fun getVolumeIdFromTreeUri(treeUri: Uri?): String? {
         val docId = DocumentsContract.getTreeDocumentId(treeUri)
@@ -327,9 +322,14 @@ object FileUtils {
 
     private fun getDocumentPathFromTreeUri(treeUri: Uri?): String {
         val docId = DocumentsContract.getTreeDocumentId(treeUri)
-        val split = docId.split(":".toRegex()).dropLastWhile { it.isEmpty() }
-        if (split.size >= 2) return split[1]
-        else return File.separator
+
+        /**
+         * A document id is "<volume>:<path>" and the path may itself contain colons, e.g.
+         * "primary:DCIM:Camera". Splitting on every colon truncated the path at the second
+         * one, so picking a directory named e.g. "Photos:2024" resolved to "Photos" and
+         * configured a completely different folder.
+         */
+        return docId.substringAfter(':', "").ifEmpty { File.separator }
     }
 
     val externalStorageDownloadsDirectory: String
@@ -348,30 +348,78 @@ object FileUtils {
 
     /**
      * Deletes a directory recursively.
+     *
+     * @return true only if the directory and everything below it is confirmed gone.
+     * A failure of any single entry is propagated, so a caller can tell a completed
+     * deletion from a partial one instead of assuming success.
      */
     @JvmStatic
     @Throws(IOException::class)
     fun deleteDirectoryRecursively(dir: File?): Boolean {
         if (dir?.exists() != true) return false
         if (dir.isFile) return dir.delete()
+        if (dir.isSymbolicLink()) {
+            // Delete a symlink without following it, exactly as the entries below do.
+            return dir.delete()
+        }
 
-        dir.listFiles()?.let {
-            for (entry in it) {
-                if (entry.isDirectory && entry.isSymbolicLink()) {
-                    // Delete symlinks without following them into arbitrary filesystem locations.
-                    entry.delete()
-                } else {
-                    deleteDirectoryRecursively(entry)
-                }
+        var allDeleted = true
+        // A null result means the directory could not be read, so nothing below it is
+        // confirmed gone and the deletion must not be reported as complete.
+        val children = dir.listFiles() ?: return false
+        for (entry in children) {
+            allDeleted = if (entry.isDirectory && entry.isSymbolicLink()) {
+                // Delete symlinks without following them into arbitrary filesystem locations.
+                entry.delete() && allDeleted
+            } else {
+                deleteDirectoryRecursively(entry) && allDeleted
             }
         }
-        return dir.delete()
+        return dir.delete() && allDeleted
+    }
+
+    /**
+     * Deletes everything inside [directory], leaving [directory] itself in place.
+     *
+     * Symlinks are deleted but never followed, so nothing outside the directory can be
+     * removed through a link inside it.
+     *
+     * @return true only if every child was confirmed deleted. false means something is
+     * still there, so a caller must not report the cleanup as successful.
+     */
+    @JvmStatic
+    fun deleteDirectoryContents(directory: File): Boolean {
+        val children = directory.listFiles() ?: return false
+        var allDeleted = true
+        for (child in children) {
+            allDeleted = deleteDirectoryRecursively(child) && allDeleted
+        }
+        return allDeleted
+    }
+
+    /**
+     * True if [candidate] is [root] itself or lies inside it, compared by canonical
+     * path.
+     *
+     * Guards destructive operations against a path component that is a symlink leading
+     * out of the tree the caller meant to operate on: deleting "through" such a link
+     * would remove content the caller never named.
+     */
+    @JvmStatic
+    fun isWithinDirectory(root: File, candidate: File): Boolean {
+        val rootPath = root.canonicalPath
+        val candidatePath = candidate.canonicalPath
+        return candidatePath == rootPath ||
+                candidatePath.startsWith(rootPath + File.separator)
     }
 
     private fun File.isSymbolicLink(): Boolean {
+        // lstat() does not follow the link. A canonical/absolute path comparison
+        // cannot be used here as it also differs when an ancestor directory is a
+        // symlink, which would flag ordinary files and directories as symlinks.
         return try {
-            canonicalFile.path != absoluteFile.path
-        } catch (_: IOException) {
+            OsConstants.S_ISLNK(Os.lstat(path).st_mode)
+        } catch (_: ErrnoException) {
             false
         }
     }
@@ -392,8 +440,8 @@ object FileUtils {
      * Derives the mime type from file extension.
      */
     fun getMimeTypeFromFileExtension(fileExtension: String): String {
-        val fileMimeType = mimeTypes.get(fileExtension.lowercase(Locale.ROOT))
-        return if (fileMimeType == null) "" else fileMimeType
+        val fileMimeType = mimeTypes[fileExtension.lowercase(Locale.ROOT)]
+        return fileMimeType ?: ""
     }
 
     fun safCreateDirectory(
@@ -410,7 +458,7 @@ object FileUtils {
                 return file
             }
         }
-        var dfNewFolder = parentFolder.createDirectory(folderName)
+        val dfNewFolder = parentFolder.createDirectory(folderName)
         if (dfNewFolder == null) {
             Log.w(TAG, "safCreateDirectory: Failed to create directory '$folderName'")
             return null
@@ -454,7 +502,7 @@ object FileUtils {
                 return false
             }
             context.contentResolver.openOutputStream(fileUri).use { outputStream ->
-                if (!content.isEmpty()) {
+                if (content.isNotEmpty()) {
                     outputStream?.write(content.toByteArray(StandardCharsets.ISO_8859_1))
                 }
             }
@@ -474,7 +522,7 @@ object FileUtils {
      * Open file in compatible app.
      */
     fun openFile(context: Context, fullPathAndFilename: String) {
-        var fileUri = Uri.parse(fullPathAndFilename)
+        var fileUri = fullPathAndFilename.toUri()
         val fileExtension = MimeTypeMap.getFileExtensionFromUrl(fileUri.toString())
         val mimeType = getMimeTypeFromFileExtension(fileExtension)
         Log.v(
@@ -511,7 +559,7 @@ object FileUtils {
         intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         try {
             context.startActivity(intent)
-        } catch (anfe: ActivityNotFoundException) {
+        } catch (_: ActivityNotFoundException) {
             Log.w(TAG, "openFile: ActivityNotFoundException. Falling back to app chooser...")
             val chooserIntent =
                 Intent.createChooser(intent, context.getString(R.string.open_file_with))
@@ -589,7 +637,7 @@ object FileUtils {
         } catch (e: Exception) {
             // FileUriExposedException is only available on API 24+; it is caught as a
             // defensive fallback even though the URIs above are content:// based.
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && e is FileUriExposedException) {
+            if (e is FileUriExposedException) {
                 Log.e(
                     TAG,
                     "openFolder: No compatible file manager app not found or has insufficient permissions (stage #1)",
@@ -628,32 +676,33 @@ object FileUtils {
     }
 
     private fun suggestFileManagerApp(context: Context) {
-        val suggestFileManagerAppDialog = AlertDialog.Builder(context)
+        AlertDialog.Builder(context)
             .setTitle(R.string.suggest_file_manager_app_dialog_title)
             .setMessage(R.string.suggest_file_manager_app_dialog_text)
             .setPositiveButton(
                 R.string.yes,
-                DialogInterface.OnClickListener { d: DialogInterface?, i: Int ->
+                { _: DialogInterface?, _: Int ->
                     val appPackageName = "me.zhanghai.android.files"
                     try {
                         context.startActivity(
                             Intent(
                                 Intent.ACTION_VIEW,
-                                Uri.parse("market://details?id=$appPackageName")
+                                "market://details?id=$appPackageName".toUri()
                             )
                         )
-                    } catch (anfe: ActivityNotFoundException) {
+                    } catch (_: Exception) {
                         context.startActivity(
                             Intent(
                                 Intent.ACTION_VIEW,
-                                Uri.parse("https://play.google.com/store/apps/details?id=$appPackageName")
+                                "https://play.google.com/store/apps/details?id=$appPackageName".toUri()
                             )
                         )
                     }
                 })
             .setNegativeButton(
                 R.string.no,
-                DialogInterface.OnClickListener { d: DialogInterface?, i: Int -> })
+                null
+            )
             .show()
     }
 
@@ -663,7 +712,7 @@ object FileUtils {
      */
     private fun getDocumentIdFromPath(fullPath: String?): String? {
         var fullPath = fullPath
-        if (fullPath == null || fullPath.isEmpty()) {
+        if (fullPath.isNullOrEmpty()) {
             return null
         }
 
@@ -711,8 +760,6 @@ object FileUtils {
         EXT_MEDIA,
         INT_MEDIA
     }
-
-
 }
 
 class MimeTypes {

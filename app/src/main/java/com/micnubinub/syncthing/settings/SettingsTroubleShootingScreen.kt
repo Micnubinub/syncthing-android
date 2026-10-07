@@ -6,12 +6,12 @@ import android.content.Intent
 import android.widget.Toast
 import androidx.activity.compose.LocalActivity
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
@@ -19,14 +19,15 @@ import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.res.stringResource
 import androidx.navigation3.runtime.EntryProviderScope
 import com.micnubinub.syncthing.R
+import com.micnubinub.syncthing.navigation.LocalSyncthingService
 import com.micnubinub.syncthing.service.Constants
 import com.micnubinub.syncthing.service.SyncthingService
+import kotlinx.coroutines.launch
 import me.zhanghai.compose.preference.MultiSelectListPreference
 import me.zhanghai.compose.preference.Preference
 import me.zhanghai.compose.preference.SwitchPreference
 import me.zhanghai.compose.preference.TextFieldPreference
 import me.zhanghai.compose.preference.rememberPreferenceState
-
 
 fun EntryProviderScope<SettingsRoute>.settingsTroubleshootingEntry() {
     entry<SettingsRoute.Troubleshooting> {
@@ -34,8 +35,6 @@ fun EntryProviderScope<SettingsRoute>.settingsTroubleshootingEntry() {
     }
 }
 
-
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsTroubleshootingScreen() {
     val context = LocalContext.current
@@ -174,6 +173,8 @@ private fun restartApp(activity: Activity?) {
 @Composable
 private fun ResetDatabasePreference() {
     val context = LocalContext.current
+    val stService = LocalSyncthingService.current
+    val scope = rememberCoroutineScope()
 
     var showAlert by rememberSaveable { mutableStateOf(false) }
 
@@ -190,12 +191,27 @@ private fun ResetDatabasePreference() {
                 TextButton(
                     onClick = {
                         showAlert = false
-                        val intent = Intent(context, SyncthingService::class.java).apply {
-                            action = SyncthingService.ACTION_RESET_DATABASE
+                        scope.launch {
+                            if (stService == null) {
+                                Toast.makeText(
+                                    context, R.string.st_reset_database_failed, Toast.LENGTH_LONG
+                                ).show()
+                                return@launch
+                            }
+                            val result =
+                                stService.performMaintenanceAndAwait(
+                                    SyncthingService.ACTION_RESET_DATABASE
+                                )
+                            Toast.makeText(
+                                context,
+                                if (result == SyncthingService.MaintenanceResult.COMPLETED) {
+                                    R.string.st_reset_database_done
+                                } else {
+                                    R.string.st_reset_database_failed
+                                },
+                                Toast.LENGTH_LONG
+                            ).show()
                         }
-                        context.startService(intent)
-                        Toast.makeText(context, R.string.st_reset_database_done, Toast.LENGTH_LONG)
-                            .show()
                     }
                 ) {
                     Text(stringResource(android.R.string.ok))
@@ -213,6 +229,8 @@ private fun ResetDatabasePreference() {
 @Composable
 private fun ResetDeltasPreference() {
     val context = LocalContext.current
+    val stService = LocalSyncthingService.current
+    val scope = rememberCoroutineScope()
 
     var showAlert by rememberSaveable { mutableStateOf(false) }
 
@@ -229,12 +247,27 @@ private fun ResetDeltasPreference() {
                 TextButton(
                     onClick = {
                         showAlert = false
-                        val intent = Intent(context, SyncthingService::class.java).apply {
-                            action = SyncthingService.ACTION_RESET_DELTAS
+                        scope.launch {
+                            if (stService == null) {
+                                Toast.makeText(
+                                    context, R.string.st_reset_deltas_failed, Toast.LENGTH_LONG
+                                ).show()
+                                return@launch
+                            }
+                            val result =
+                                stService.performMaintenanceAndAwait(
+                                    SyncthingService.ACTION_RESET_DELTAS
+                                )
+                            Toast.makeText(
+                                context,
+                                if (result == SyncthingService.MaintenanceResult.COMPLETED) {
+                                    R.string.st_reset_deltas_done
+                                } else {
+                                    R.string.st_reset_deltas_failed
+                                },
+                                Toast.LENGTH_LONG
+                            ).show()
                         }
-                        context.startService(intent)
-                        Toast.makeText(context, R.string.st_reset_deltas_done, Toast.LENGTH_LONG)
-                            .show()
                     }
                 ) {
                     Text(stringResource(android.R.string.ok))

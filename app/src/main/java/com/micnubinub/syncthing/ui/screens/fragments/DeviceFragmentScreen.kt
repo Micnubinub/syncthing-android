@@ -102,7 +102,6 @@ fun DeviceFragmentScreen(
     DeviceFragmentContent(
         state = state,
         modifier = modifier,
-        serviceState = serviceState,
         viewModel = viewModel
     )
 }
@@ -110,7 +109,6 @@ fun DeviceFragmentScreen(
 @Composable
 private fun DeviceFragmentContent(
     state: DeviceFragmentState,
-    serviceState: SyncthingService.State,
     viewModel: DeviceFragmentViewModel,
     modifier: Modifier = Modifier
 ) {
@@ -208,12 +206,11 @@ private fun DeviceItem(
     val statusText = stringResource(uiState.textResId, *uiState.formatArgs.toTypedArray())
     val statusColor = colorResource(uiState.colorResId)
 
-    val deviceLastSeen = lastSeen
-    val formattedLastSeen = remember(deviceLastSeen) {
-        if (deviceLastSeen.isEmpty() || deviceLastSeen == TIMESTAMP_NEVER_SEEN) {
+    val formattedLastSeen = remember(lastSeen) {
+        if (lastSeen.isEmpty() || lastSeen == TIMESTAMP_NEVER_SEEN) {
             null
         } else {
-            Util.formatDateTime(deviceLastSeen).orEmpty()
+            Util.formatDateTime(lastSeen).orEmpty()
         }
     }
     val lastSeenText = stringResource(

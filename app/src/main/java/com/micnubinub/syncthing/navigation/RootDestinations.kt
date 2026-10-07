@@ -28,7 +28,6 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.togetherWith
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
@@ -64,9 +63,9 @@ import com.micnubinub.syncthing.service.Constants
 import com.micnubinub.syncthing.service.SyncthingService
 import com.micnubinub.syncthing.settings.LocalSettingsNavigator
 import com.micnubinub.syncthing.settings.Navigator
+import com.micnubinub.syncthing.settings.ProvideSharedPreferenceLocals
 import com.micnubinub.syncthing.settings.SettingsNavDisplay
 import com.micnubinub.syncthing.settings.SettingsRoute
-import com.micnubinub.syncthing.settings.createPreferenceFlow
 import com.micnubinub.syncthing.settings.rememberSettingsNavBackStack
 import com.micnubinub.syncthing.ui.screens.DeviceActivityScreen
 import com.micnubinub.syncthing.ui.screens.FolderActivityScreen
@@ -107,11 +106,9 @@ import com.micnubinub.syncthing.util.Util
 import com.micnubinub.syncthing.webgui.WebGuiScreen
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import me.zhanghai.compose.preference.Preferences
-import me.zhanghai.compose.preference.ProvidePreferenceLocals
 import java.io.File
 import java.io.FileInputStream
 import java.io.InputStream
@@ -128,7 +125,6 @@ private const val TAG = "RootDestinations"
  * Hosts the single root back stack of the app. Provides the [LocalRootNavigator] and preference
  * locals used by every destination below and renders the active destination.
  */
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun RootNavDisplay(
     backStack: NavBackStack<RootRoute>,
@@ -141,20 +137,11 @@ fun RootNavDisplay(
     val activity = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwnerX.current
     val activityScope = remember(lifecycleOwner) { lifecycleOwner.lifecycleScope }
-    val prefFlow = remember(preferences, activityScope) {
-        createPreferenceFlow(preferences, activityScope)
-    }
-
     CompositionLocalProvider(
         LocalRootNavigator provides navigator,
         LocalActivityScope provides activityScope,
     ) {
-        // The preference library's ProvidePreferenceLocals requires a
-        // MutableStateFlow to write edits back. The flow is created mutable in
-        // createPreferenceFlow but exposed as an immutable StateFlow everywhere
-        // else, so only this root provider can replace its value.
-        @Suppress("UNCHECKED_CAST")
-        ProvidePreferenceLocals(flow = prefFlow as MutableStateFlow<Preferences>) {
+        ProvideSharedPreferenceLocals(preferences, activityScope) {
             NavDisplay(
                 backStack = backStack,
                 onBack = { navigator.navigateBack() },
@@ -227,26 +214,25 @@ private fun OnboardingDestination(preferences: SharedPreferences) {
     var uiState by rememberSaveable {
         mutableStateOf(
             initialOnboardingUiState(
-                context,
-                preferences
+                context
             )
         )
     }
 
-    lateinit var controller: OnboardingController
+    var controller by remember { mutableStateOf<OnboardingController?>(null) }
 
     val storagePermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { isGranted -> controller.onPermissionResult(OnboardingPermission.STORAGE, isGranted) }
+    ) { isGranted -> controller?.onPermissionResult(OnboardingPermission.STORAGE, isGranted) }
 
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { isGranted -> controller.onPermissionResult(OnboardingPermission.NOTIFICATION, isGranted) }
+    ) { isGranted -> controller?.onPermissionResult(OnboardingPermission.NOTIFICATION, isGranted) }
 
     val localNetworkPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { isGranted ->
-        controller.onPermissionResult(
+        controller?.onPermissionResult(
             OnboardingPermission.LOCAL_NETWORK,
             isGranted
         )
@@ -255,7 +241,7 @@ private fun OnboardingDestination(preferences: SharedPreferences) {
     val coarseLocationPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { isGranted ->
-        controller.onPermissionResult(
+        controller?.onPermissionResult(
             OnboardingPermission.COARSE_LOCATION,
             isGranted
         )
@@ -264,7 +250,7 @@ private fun OnboardingDestination(preferences: SharedPreferences) {
     val backgroundLocationPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { isGranted ->
-        controller.onPermissionResult(
+        controller?.onPermissionResult(
             OnboardingPermission.BACKGROUND_LOCATION,
             isGranted
         )
@@ -272,13 +258,13 @@ private fun OnboardingDestination(preferences: SharedPreferences) {
 
     val fineLocationPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { isGranted -> controller.onFineLocationPermissionResult(isGranted) }
+    ) { isGranted -> controller?.onFineLocationPermissionResult(isGranted) }
 
     val androidQLocationPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { results -> controller.onAndroidQLocationPermissionResult(results) }
+    ) { results -> controller?.onAndroidQLocationPermissionResult(results) }
 
-    controller = remember {
+    val onboardingController = remember {
         OnboardingController(
             context = context,
             activity = activity,
@@ -296,11 +282,12 @@ private fun OnboardingDestination(preferences: SharedPreferences) {
             androidQLocationPermissionLauncher = androidQLocationPermissionLauncher,
         )
     }
+    controller = onboardingController
 
     // Re-derive permissions after the state is restored (rotation) and resume the key-generation
     // coroutine if the flow still sits on the key generation page.
     LaunchedEffect(Unit) {
-        controller.restoreState()
+        onboardingController.restoreState()
     }
 
     // Auto-advance when the user returns from a system permission dialog.
@@ -308,7 +295,7 @@ private fun OnboardingDestination(preferences: SharedPreferences) {
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
-                controller.handleOnResume()
+                onboardingController.handleOnResume()
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -316,14 +303,14 @@ private fun OnboardingDestination(preferences: SharedPreferences) {
     }
 
     OnboardingScreen(
-        uiState = controller.uiState,
-        onBack = controller::handleBack,
-        onContinue = controller::advance,
-        onFinishOnboarding = controller::finishOnboarding,
-        onGrantStoragePermission = controller::requestStoragePermission,
-        onGrantLocationPermission = controller::requestLocationPermission,
-        onGrantLocalNetworkPermission = controller::requestLocalNetworkPermission,
-        onGrantNotificationPermission = controller::requestNotificationPermission,
+        uiState = onboardingController.uiState,
+        onBack = onboardingController::handleBack,
+        onContinue = onboardingController::advance,
+        onFinishOnboarding = onboardingController::finishOnboarding,
+        onGrantStoragePermission = onboardingController::requestStoragePermission,
+        onGrantLocationPermission = onboardingController::requestLocationPermission,
+        onGrantLocalNetworkPermission = onboardingController::requestLocalNetworkPermission,
+        onGrantNotificationPermission = onboardingController::requestNotificationPermission,
     )
 }
 
@@ -551,7 +538,11 @@ private class OnboardingController(
         scope.launch {
             val errorMessage = withContext(Dispatchers.IO) {
                 try {
-                    ConfigXml(context).generateConfig()
+                    // generateConfig() writes config.xml and the key files, so it must
+                    // not overlap with a core start or with a [ConfigRouter] save.
+                    SyncthingService.coreLifecycleMutex.withLock {
+                        ConfigXml(context).generateConfig()
+                    }
                     null
                 } catch (e: com.micnubinub.syncthing.service.SyncthingRunnable.ExecutableNotFoundException) {
                     context.getString(R.string.executable_not_found, e.message)
@@ -596,8 +587,7 @@ private class OnboardingController(
 }
 
 private fun initialOnboardingUiState(
-    context: Context,
-    preferences: SharedPreferences,
+    context: Context
 ): OnboardingUiState {
     val haveStoragePermission = PermissionUtil.haveStoragePermission(context)
     val haveNotificationPermission = haveNotificationPermission(context)
@@ -640,20 +630,14 @@ private fun checkForParseableConfig(context: Context): Boolean {
 }
 
 private fun haveNotificationPermission(context: Context): Boolean {
-    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
-        return true
-    }
-    return ContextCompat.checkSelfPermission(
+    return Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU || ContextCompat.checkSelfPermission(
         context,
         Manifest.permission.POST_NOTIFICATIONS
     ) == PackageManager.PERMISSION_GRANTED
 }
 
 private fun haveLocalNetworkPermission(context: Context): Boolean {
-    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.CINNAMON_BUN) {
-        return true
-    }
-    return ContextCompat.checkSelfPermission(
+    return Build.VERSION.SDK_INT < Build.VERSION_CODES.CINNAMON_BUN || ContextCompat.checkSelfPermission(
         context,
         Manifest.permission.ACCESS_LOCAL_NETWORK
     ) == PackageManager.PERMISSION_GRANTED
@@ -665,14 +649,11 @@ private fun haveLocationPermission(context: Context): Boolean {
         Manifest.permission.ACCESS_COARSE_LOCATION
     ) == PackageManager.PERMISSION_GRANTED
 
-    val backgroundLocationGranted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-        ContextCompat.checkSelfPermission(
+    val backgroundLocationGranted =
+        Build.VERSION.SDK_INT < Build.VERSION_CODES.Q || ContextCompat.checkSelfPermission(
             context,
             Manifest.permission.ACCESS_BACKGROUND_LOCATION
         ) == PackageManager.PERMISSION_GRANTED
-    } else {
-        true
-    }
 
     return coarseLocationGranted && backgroundLocationGranted
 }
@@ -845,7 +826,7 @@ private fun WebViewDestination(url: String) {
     WebViewActivityScreen(
         viewModel = viewModel,
         onOpenInBrowser = {
-            context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+            context.startActivity(Intent(Intent.ACTION_VIEW, url.toUri()))
             navigator.navigateBack()
         },
         onNavigateBack = { navigator.navigateBack() },
@@ -1072,8 +1053,8 @@ private fun shouldOpenOutsideWebView(
     // (scheme, host, and port). Different scheme or port means a different origin
     // and must be opened externally so the auth header is never forwarded.
     // Host and scheme comparisons are lower-cased because both are case-insensitive.
-    if (host != null && host.lowercase() == webGuiHost.lowercase() &&
-        scheme?.lowercase() == webGuiScheme.lowercase() && port == webGuiPort
+    if (host != null && host.equals(webGuiHost, ignoreCase = true) &&
+        scheme.equals(webGuiScheme, ignoreCase = true) && port == webGuiPort
     ) {
         return false
     }
@@ -1132,13 +1113,12 @@ private fun handleSslError(
     // Otherwise, fall back to pinning against the local instance's self-signed certificate.
     try {
         val certificate = extractCertificate(error.certificate)
-        val ca = caCertificate
-        if (certificate == null || ca == null) {
+        if (certificate == null || caCertificate == null) {
             Log.w(TAG, "X509Certificate reference invalid")
             handler.cancel()
             return
         }
-        certificate.verify(ca.publicKey)
+        certificate.verify(caCertificate.publicKey)
         handler.proceed()
     } catch (e: Exception) {
         Log.w(TAG, e)

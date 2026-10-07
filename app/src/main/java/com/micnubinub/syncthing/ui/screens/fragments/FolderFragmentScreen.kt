@@ -343,7 +343,7 @@ private fun FolderItem(
                 }
             }
         }
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Column(horizontalAlignment = Alignment.End) {
             Text(
                 text = statusText,
                 style = MaterialTheme.typography.bodyMedium,
