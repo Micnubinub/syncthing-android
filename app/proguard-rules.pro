@@ -1,6 +1,4 @@
 -repackageclasses ''
--allowaccessmodification
--mergeinterfacesaggressively
 -overloadaggressively
 
 # Strip verbose/debug/info/warn logging from release builds.
@@ -11,53 +9,34 @@
     public static int w(...);
 }
 
-# Signature / InnerClasses / EnclosingMethod / RuntimeVisible*Annotations are
-# kept by the AGP-generated default rules (needed for Gson generic type
-# resolution, Guava TypeToken and kotlinx.serialization).
-# LineNumberTable omitted intentionally – saves significant DEX space.
-# Stack traces still show class + method; -renamesourcefileattribute masks file names.
--renamesourcefileattribute SourceFile
+# -allowaccessmodification and the Signature / InnerClasses / EnclosingMethod /
+# RuntimeVisible*Annotations attributes come from proguard-android-optimize.txt.
+# LineNumberTable and SourceFile are omitted intentionally to save DEX space.
 
 # ─────────────────────────────────────────────────────────────
-# Gson models – field names must match Syncthing REST JSON keys
-# (no @SerializedName; plain Kotlin data classes deserialised via
-#  Gson reflectively via TypeToken<T>, so obfuscation of class
-#  names is safe – the Signature attribute preserves the type.
-#  The unqualified -keepclassmembers below preserves field names.)
+# Gson – no @SerializedName, so field names are the JSON keys.
+# Model classes: keys must match the Syncthing REST / config JSON.
+# SharedPrefsBackup: written by config export and read by import, possibly
+#   from another app version, so its keys must be stable across builds.
+# Class names may be obfuscated. Constructors are kept so R8 treats the
+# classes as instantiated (Gson creates them reflectively).
+# LocalCompletion / RemoteCompletion and the ViewModels in model/ are not
+# serialised and are excluded.
 # ─────────────────────────────────────────────────────────────
--keep,allowobfuscation class com.micnubinub.syncthing.model.** {
-    <fields>;
+-keep,allowobfuscation class !com.micnubinub.syncthing.model.*Completion,!com.micnubinub.syncthing.model.*ViewModel*,com.micnubinub.syncthing.model.** {
     <init>(...);
 }
--keepclassmembers class com.micnubinub.syncthing.model.** {
-    <fields>;
-}
-
-# SharedPrefsBackup round-trips through Gson within the same build, so
-# field names can be obfuscated, but fields must survive shrinking.
 -keep,allowobfuscation class com.micnubinub.syncthing.service.SyncthingService$SharedPrefsBackup {
-    <fields>;
     <init>(...);
 }
+-keepclassmembers class !com.micnubinub.syncthing.model.*Completion,!com.micnubinub.syncthing.model.*ViewModel*,com.micnubinub.syncthing.model.** {
+    <fields>;
+}
+-keepclassmembers class com.micnubinub.syncthing.service.SyncthingService$SharedPrefsBackup {
+    <fields>;
+}
 
-# Guava TypeToken used with Gson (anonymous subclasses resolved reflectively)
--keep,allowobfuscation class com.google.common.reflect.TypeToken
--keep,allowobfuscation class * extends com.google.common.reflect.TypeToken
-
-# ─────────────────────────────────────────────────────────────
-# Reflection / platform internals
-# ─────────────────────────────────────────────────────────────
--dontwarn android.os.storage.StorageVolume
--dontwarn android.app.LoadedApk
--dontwarn android.net.ProxyInfo
--dontwarn android.net.http.SslCertificate
-
-# ─────────────────────────────────────────────────────────────
-# Suppress warnings for optional / platform providers
-# ─────────────────────────────────────────────────────────────
--dontwarn at.favre.lib.crypto.bcrypt.**
--dontwarn com.google.errorprone.annotations.**
--dontwarn javax.annotation.**
--dontwarn okhttp3.internal.platform.**
--dontwarn org.openjsse.**
--dontwarn sun.misc.Unsafe
+# Guava TypeToken is used with Gson. The anonymous subclasses need their generic
+# Signature, which R8 full mode only keeps on kept classes. Gson's bundled rules
+# cover com.google.gson.reflect.TypeToken only.
+-keep,allowobfuscation,allowshrinking class * extends com.google.common.reflect.TypeToken
