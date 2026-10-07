@@ -35,6 +35,8 @@ import com.micnubinub.syncthing.service.Constants
 import com.micnubinub.syncthing.service.RestApi
 import com.micnubinub.syncthing.service.SyncthingService
 import com.micnubinub.syncthing.util.FileUtils
+import com.micnubinub.syncthing.util.FileUtils.deleteDirectoryContents
+import com.micnubinub.syncthing.util.FileUtils.isWithinDirectory
 import com.micnubinub.syncthing.util.LocalActivityScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
@@ -116,7 +118,18 @@ fun SettingsSyncthingOptionsScreen() {
                 apiPrefFlow
                     .drop(1)
                     .debounce(0.5.seconds)
-                    .collect { currentApi.preferences = it }
+                    .collect {
+                        if (currentApi.applySyncthingOptions(it) != RestApi.ConfigSaveResult.SAVED) {
+                            // The core never saw the edit, so put the last known good
+                            // values back on screen instead of leaving them showing.
+                            apiPrefFlow.value = currentApi.preferences
+                            Toast.makeText(
+                                context,
+                                R.string.config_save_failed,
+                                Toast.LENGTH_LONG
+                            ).show()
+                        }
+                    }
             }
         }
     }
@@ -412,14 +425,14 @@ private fun ClearStVersionPreference(
                         stService?.api?.let { api ->
                             scope.launch(Dispatchers.IO) {
                                 val folders = api.folders
-                                if (clearStVersions(folders)) {
-                                    withContext(Dispatchers.Main) {
-                                        Toast.makeText(
-                                            context,
-                                            R.string.clear_stversions_done,
-                                            Toast.LENGTH_LONG
-                                        ).show()
-                                    }
+                                val cleared = clearStVersions(folders)
+                                withContext(Dispatchers.Main) {
+                                    Toast.makeText(
+                                        context,
+                                        if (cleared) R.string.clear_stversions_done
+                                        else R.string.clear_stversions_failed,
+                                        Toast.LENGTH_LONG
+                                    ).show()
                                 }
                             }
                         }
@@ -465,12 +478,15 @@ private fun UndoIgnoredDevicesFoldersPreference(
                         showAlert = false
                         stService?.api?.let { api ->
                             scope.launch(Dispatchers.IO) {
-                                api.undoIgnoredDevicesAndFolders()
-                                api.sendConfig()
+                                val undone = api.undoIgnoredDevicesAndFolders()
                                 withContext(Dispatchers.Main) {
                                     Toast.makeText(
                                         context,
-                                        R.string.undo_ignored_devices_folders_done,
+                                        if (undone == RestApi.ConfigSaveResult.SAVED) {
+                                            R.string.undo_ignored_devices_folders_done
+                                        } else {
+                                            R.string.undo_ignored_devices_folders_failed
+                                        },
                                         Toast.LENGTH_LONG
                                     ).show()
                                 }
@@ -555,7 +571,7 @@ private enum class SupportBundleDownloadState {
     INIT, DOWNLOADING, SUCCESS, FAILED
 }
 
-private var RestApi.preferences: Preferences
+private val RestApi.preferences: Preferences
     get() {
         if (!isConfigLoaded) return MapPreferences()
 
@@ -587,112 +603,116 @@ private var RestApi.preferences: Preferences
 
         return MapPreferences(values)
     }
-    set(value) {
-        val splitter = Splitter.on(",").trimResults().omitEmptyStrings()
-        val valueMap = value.asMap()
 
-        // update calls that change internal state of RestApi
-        (valueMap[Keys.USAGE_REPORTING] as? Boolean)?.let { setUsageReporting(it) }
+/**
+ * Applies [value] to the Syncthing options/GUI and the local device name in one config write,
+ * and reports what the core made of it.
+ */
+private suspend fun RestApi.applySyncthingOptions(value: Preferences): RestApi.ConfigSaveResult {
+    val splitter = Splitter.on(",").trimResults().omitEmptyStrings()
+    val valueMap = value.asMap()
 
-        // assignments to options and gui
-        val options = options
-        val gui = gui
-        for ((key, mapValue) in valueMap) {
-            when (key) {
-                Keys.LISTEN_ADDRESSES -> {
-                    val addresses = (mapValue as? String) ?: continue
-                    options?.listenAddresses = splitter.splitToList(addresses)
-                }
+    // update calls that change internal state of RestApi
+    (valueMap[Keys.USAGE_REPORTING] as? Boolean)?.let { setUsageReporting(it) }
 
-                Keys.INCOMING_RATE_LIMIT -> {
-                    options?.maxRecvKbps = (mapValue as? Int) ?: continue
-                }
+    // assignments to options and gui
+    val options = options
+    val gui = gui
+    for ((key, mapValue) in valueMap) {
+        when (key) {
+            Keys.LISTEN_ADDRESSES -> {
+                val addresses = (mapValue as? String) ?: continue
+                options?.listenAddresses = splitter.splitToList(addresses)
+            }
 
-                Keys.OUTGOING_RATE_LIMIT -> {
-                    options?.maxSendKbps = (mapValue as? Int) ?: continue
-                }
+            Keys.INCOMING_RATE_LIMIT -> {
+                options?.maxRecvKbps = (mapValue as? Int) ?: continue
+            }
 
-                Keys.NAT_TRAVERSAL -> {
-                    options?.natEnabled = (mapValue as? Boolean) ?: continue
-                }
+            Keys.OUTGOING_RATE_LIMIT -> {
+                options?.maxSendKbps = (mapValue as? Int) ?: continue
+            }
 
-                Keys.LOCAL_DISCOVERY -> {
-                    options?.localAnnounceEnabled = (mapValue as? Boolean) ?: continue
-                }
+            Keys.NAT_TRAVERSAL -> {
+                options?.natEnabled = (mapValue as? Boolean) ?: continue
+            }
 
-                Keys.GLOBAL_DISCOVERY -> {
-                    options?.globalAnnounceEnabled = (mapValue as? Boolean) ?: continue
-                }
+            Keys.LOCAL_DISCOVERY -> {
+                options?.localAnnounceEnabled = (mapValue as? Boolean) ?: continue
+            }
 
-                Keys.RELAYING -> {
-                    options?.relaysEnabled = (mapValue as? Boolean) ?: continue
-                }
+            Keys.GLOBAL_DISCOVERY -> {
+                options?.globalAnnounceEnabled = (mapValue as? Boolean) ?: continue
+            }
 
-                Keys.GLOBAL_SERVERS -> {
-                    val servers = (mapValue as? String) ?: continue
-                    options?.globalAnnounceServers = splitter.splitToList(servers)
-                }
+            Keys.RELAYING -> {
+                options?.relaysEnabled = (mapValue as? Boolean) ?: continue
+            }
 
-                Keys.CRASH_REPORTING -> {
-                    options?.crashReportingEnabled = (mapValue as? Boolean) ?: continue
-                }
+            Keys.GLOBAL_SERVERS -> {
+                val servers = (mapValue as? String) ?: continue
+                options?.globalAnnounceServers = splitter.splitToList(servers)
+            }
 
-                Keys.WEB_GUI_REMOTE_ACCESS -> {
-                    val boolVal = mapValue as? Boolean ?: continue
-                    val address = if (boolVal) BIND_ALL else BIND_LOCALHOST
-                    val port =
-                        (valueMap[Keys.WEB_GUI_PORT] as? Int) ?: Constants.DEFAULT_WEBGUI_TCP_PORT
-                    gui?.address = "$address:$port"
-                }
+            Keys.CRASH_REPORTING -> {
+                options?.crashReportingEnabled = (mapValue as? Boolean) ?: continue
+            }
 
-                Keys.WEB_GUI_PORT -> {/* Ignore here, handled in WEB_GUI_REMOTE_ACCESS */
-                }
+            Keys.WEB_GUI_REMOTE_ACCESS -> {
+                val boolVal = mapValue as? Boolean ?: continue
+                val address = if (boolVal) BIND_ALL else BIND_LOCALHOST
+                val port =
+                    (valueMap[Keys.WEB_GUI_PORT] as? Int) ?: Constants.DEFAULT_WEBGUI_TCP_PORT
+                gui?.address = "$address:$port"
+            }
 
-                Keys.WEB_GUI_USERNAME -> {
-                    gui?.user = (mapValue as? String) ?: continue
-                }
+            Keys.WEB_GUI_PORT -> {/* Ignore here, handled in WEB_GUI_REMOTE_ACCESS */
+            }
 
-                Keys.WEB_GUI_PASSWORD -> {
-                    val password = (mapValue as? String) ?: continue
-                    val hashed =
-                        BCrypt.withDefaults().hashToString(4, password.toCharArray())
-                    gui?.password = hashed
-                }
+            Keys.WEB_GUI_USERNAME -> {
+                gui?.user = (mapValue as? String) ?: continue
+            }
+
+            Keys.WEB_GUI_PASSWORD -> {
+                val password = (mapValue as? String) ?: continue
+                val hashed =
+                    BCrypt.withDefaults().hashToString(4, password.toCharArray())
+                gui?.password = hashed
             }
         }
-        // does not call sendConfig
-        editSettings(gui, options)
-
-        localDevice?.let { device ->
-            val deviceName = valueMap[Keys.DEVICE_NAME] as? String ?: localDevice?.name
-            deviceName?.let {
-                localDevice?.name = it
-            }
-            // this calls the sendConfig method
-
-            updateDevice(device)
-        }
-
     }
-
-private fun clearStVersions(folders: List<Folder>): Boolean {
-    for (folder in folders) {
-        val dir = File(folder.path + "/" + Constants.FOLDER_NAME_STVERSIONS)
-        if (dir.exists() && dir.isDirectory) {
-            Log.d(TAG, "Delete dir: $dir")
-            deleteContents(dir)
+    // One config write has to carry the settings edits and the device rename, otherwise
+    // the rename can be posted without the settings it was part of.
+    val device = localDevice
+    return editSettings(
+        gui,
+        options,
+        device?.also {
+            it.name = (valueMap[Keys.DEVICE_NAME] as? String) ?: it.name
         }
-    }
-    return true
+    )
 }
 
-private fun deleteContents(dir: File) {
-    dir.listFiles()?.let {
-        for (file in it) {
-            if (file.isDirectory) {
-                deleteContents(file)
-            }
-            file.delete()
+private fun clearStVersions(folders: List<Folder>): Boolean {
+    var allDeleted = true
+    for (folder in folders) {
+        val folderRoot = File(folder.path.orEmpty())
+        val dir = File(folderRoot, Constants.FOLDER_NAME_STVERSIONS)
+        if (!dir.exists() || !dir.isDirectory) {
+            continue
         }
+        // .stversions itself may be a symlink; clearing "through" it would wipe
+        // whatever it points at, so refuse rather than follow it.
+        if (!isWithinDirectory(folderRoot, dir)) {
+            Log.w(
+                TAG,
+                "clearStVersions: '$dir' is not inside '${folderRoot.absolutePath}', skipping"
+            )
+            allDeleted = false
+            continue
+        }
+        Log.d(TAG, "Delete contents of: $dir")
+        allDeleted = deleteDirectoryContents(dir) && allDeleted
     }
+    return allDeleted
 }

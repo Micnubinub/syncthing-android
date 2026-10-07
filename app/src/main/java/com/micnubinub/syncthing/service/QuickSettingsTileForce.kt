@@ -4,15 +4,13 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.content.res.Resources
 import android.graphics.drawable.Icon
-import android.os.Build
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
-import androidx.annotation.RequiresApi
 import androidx.core.content.edit
 import androidx.preference.PreferenceManager
 import com.micnubinub.syncthing.R
 
-@RequiresApi(api = Build.VERSION_CODES.N)
+
 class QuickSettingsTileForce : TileService() {
     private var context: Context? = null
     private var preferences: SharedPreferences? = null // Manually initialized
@@ -50,6 +48,12 @@ class QuickSettingsTileForce : TileService() {
     }
 
     override fun onClick() {
+        val tile = qsTile ?: return
+        if (tile.state == Tile.STATE_UNAVAILABLE) {
+            // The service is not running, so a forced state would only be stored and
+            // reported as done; onStartListening marks the tile unavailable in that case.
+            return
+        }
         val newState: Int = when (preferences?.getInt(
             Constants.PREF_BTNSTATE_FORCE_START_STOP,
             Constants.BTNSTATE_NO_FORCE_START_STOP
@@ -65,8 +69,8 @@ class QuickSettingsTileForce : TileService() {
 
         RunConditionBus.tryEmit(RunConditionEvent.UpdateShouldRunDecision)
 
-        updateTileState(qsTile, newState)
-        qsTile.updateTile()
+        updateTileState(tile, newState)
+        tile.updateTile()
     }
 
     private fun updateTileState(tile: Tile, force: Int) {

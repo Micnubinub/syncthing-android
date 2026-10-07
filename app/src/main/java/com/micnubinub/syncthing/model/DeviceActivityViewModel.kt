@@ -3,6 +3,7 @@ package com.micnubinub.syncthing.ui.viewModels
 import android.app.Activity
 import android.content.SharedPreferences
 import android.util.Log
+import android.widget.Toast
 import androidx.annotation.StringRes
 import androidx.core.content.edit
 import androidx.lifecycle.ViewModel
@@ -114,6 +115,13 @@ class DeviceActivityViewModel : ViewModel() {
     private var compressionValues: List<String> = emptyList()
     private var device: Device? = null
     private var lastInitializedRoute: String? = null
+
+    /**
+     * Share state of every folder as it was loaded, so a save only writes the shares the
+     * user actually changed instead of re-posting every folder from a snapshot taken
+     * when the screen was opened.
+     */
+    private var loadedFolderShares: Map<String?, FolderShareState> = emptyMap()
 
     fun initialize(
         config: ConfigRouter,
@@ -379,13 +387,19 @@ class DeviceActivityViewModel : ViewModel() {
     private fun onDeleteConfirmed() {
         val currentDevice = device
         viewModelScope.launch {
-            withContext(Dispatchers.IO) {
+            val result = withContext(Dispatchers.IO) {
                 currentDevice?.deviceID?.let { deviceId ->
                     config?.removeDevice(restApi, deviceId)
-                }
+                } ?: RestApi.ConfigSaveResult.SKIPPED
             }
             _state.update { it.copy(showDeleteDialog = false, deviceNeedsToUpdate = false) }
-            _events.trySend(DeviceActivityEvent.Finish(Activity.RESULT_OK))
+            if (result == RestApi.ConfigSaveResult.SAVED) {
+                _events.trySend(DeviceActivityEvent.Finish(Activity.RESULT_OK))
+            } else {
+                _events.trySend(
+                    DeviceActivityEvent.ShowToast(R.string.config_save_failed, Toast.LENGTH_LONG)
+                )
+            }
         }
     }
 
@@ -414,29 +428,26 @@ class DeviceActivityViewModel : ViewModel() {
         // Folder updates and device updates perform blocking config I/O; keep
         // them off the main thread and only touch the UI afterwards.
         viewModelScope.launch {
-            val resultCode = withContext(Dispatchers.IO) {
-                // Update folder sharing and encryption passwords.
-                for (folderState in currentState.folders) {
-                    val folder = folderState.folder
-                    if (folderState.shared) {
-                        folder.addDevice(currentDevice)
-                        folder.getDevice(currentDevice.deviceID)?.encryptionPassword =
-                            folderState.encryptionPassword
-                    } else {
-                        folder.removeDevice(currentDevice.deviceID)
-                    }
-                    config?.updateFolder(restApi, folder)
-                }
-
+            val outcome = withContext(Dispatchers.IO) {
+                // The device has to exist before a folder can refer to it: a share
+                // written for a device the core does not know is dropped on the floor.
+                var wroteAnything = false
                 when {
                     currentState.isCreateMode -> {
                         Log.v(TAG, "onSave: Adding device with ID = '${currentDevice.deviceID}'")
-                        config?.updateDevice(restApi, currentDevice)
-                        Activity.RESULT_OK
+                        val result = config?.updateDevice(restApi, currentDevice)
+                            ?: RestApi.ConfigSaveResult.SKIPPED
+                        if (result != RestApi.ConfigSaveResult.SAVED) {
+                            return@withContext result
+                        }
+                        wroteAnything = true
                     }
 
                     // Edit mode, nothing to save.
-                    !currentState.deviceNeedsToUpdate -> Activity.RESULT_CANCELED
+                    !currentState.deviceNeedsToUpdate -> Log.v(
+                        TAG,
+                        "onSave: Device with ID = '${currentDevice.deviceID}' unchanged"
+                    )
 
                     else -> {
                         // Save device specific preferences.
@@ -451,12 +462,74 @@ class DeviceActivityViewModel : ViewModel() {
                         }
 
                         // Update device using RestApi or ConfigXml.
-                        config?.updateDevice(restApi, currentDevice)
-                        Activity.RESULT_OK
+                        val result = config?.updateDevice(restApi, currentDevice)
+                            ?: RestApi.ConfigSaveResult.SKIPPED
+                        if (result != RestApi.ConfigSaveResult.SAVED) {
+                            return@withContext result
+                        }
+                        wroteAnything = true
                     }
                 }
+
+                // Only folders whose share actually changed are written, and each one is
+                // re-read immediately before it is patched: posting the folder as it was
+                // when this screen opened would revert every change made elsewhere in the
+                // meantime (introducer, auto-accept, Web UI, pause, a remote share).
+                for (folderState in currentState.folders) {
+                    val folderId = folderState.folder.id
+                    val loaded = loadedFolderShares[folderId]
+                    val passwordChanged = folderState.shared &&
+                            folderState.encryptionPassword != loaded?.encryptionPassword
+                    if (loaded != null &&
+                        loaded.shared == folderState.shared && !passwordChanged
+                    ) {
+                        continue
+                    }
+                    val folder = config?.getFolders(restApi)
+                        ?.firstOrNull { it.id == folderId }
+                        ?: continue
+                    if (folderState.shared) {
+                        folder.addDevice(currentDevice)
+                        folder.getDevice(currentDevice.deviceID)?.encryptionPassword =
+                            folderState.encryptionPassword
+                    } else {
+                        folder.removeDevice(currentDevice.deviceID)
+                    }
+                    val result = config?.updateFolder(restApi, folder)
+                        ?: RestApi.ConfigSaveResult.SKIPPED
+                    if (result != RestApi.ConfigSaveResult.SAVED) {
+                        return@withContext result
+                    }
+                    wroteAnything = true
+                }
+
+                if (wroteAnything) {
+                    RestApi.ConfigSaveResult.SAVED
+                } else {
+                    RestApi.ConfigSaveResult.SKIPPED
+                }
             }
-            _events.trySend(DeviceActivityEvent.Finish(resultCode))
+            // Only leave the screen once every write reached the core; a failed one has to
+            // stay editable so the user can retry instead of silently losing the change.
+            val noChanges = !currentState.isCreateMode && !currentState.deviceNeedsToUpdate
+            when (outcome) {
+                RestApi.ConfigSaveResult.SAVED -> {
+                    _events.trySend(DeviceActivityEvent.Finish(Activity.RESULT_OK))
+                }
+
+                RestApi.ConfigSaveResult.SKIPPED if noChanges -> {
+                    _events.trySend(DeviceActivityEvent.Finish(Activity.RESULT_CANCELED))
+                }
+
+                else -> {
+                    _events.trySend(
+                        DeviceActivityEvent.ShowToast(
+                            R.string.config_save_failed,
+                            Toast.LENGTH_LONG
+                        )
+                    )
+                }
+            }
         }
     }
 
@@ -496,7 +569,7 @@ class DeviceActivityViewModel : ViewModel() {
 
     private suspend fun loadFolders(): List<FolderShareState> = withContext(Dispatchers.IO) {
         val deviceId = device?.deviceID
-        config?.getFolders(restApi)?.map { folder ->
+        val loaded = config?.getFolders(restApi)?.map { folder ->
             val sharedWithDevice = folder.getDevice(deviceId)
             FolderShareState(
                 folder = folder,
@@ -504,6 +577,8 @@ class DeviceActivityViewModel : ViewModel() {
                 encryptionPassword = sharedWithDevice?.encryptionPassword.orEmpty()
             )
         }.orEmpty()
+        loadedFolderShares = loaded.associateBy { it.folder.id }
+        loaded
     }
 
     private fun compressionFromValue(value: String?): Compression {

@@ -1,6 +1,7 @@
 package com.micnubinub.syncthing.http
 
 import android.content.Context
+import android.os.SystemClock
 import android.util.Log
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -15,10 +16,12 @@ import java.net.ConnectException
 import java.net.URL
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
+import kotlin.time.Duration.Companion.milliseconds
 
 class PollWebGuiAvailableTask(
     context: Context?, url: URL, apiKey: String?,
     private val listener: OnSuccessListener?,
+    private val onTimeout: (String) -> Unit = {},
     parentJob: Job? = null
 ) : ApiRequest(context, url, "", apiKey) {
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob(parentJob))
@@ -42,7 +45,19 @@ class PollWebGuiAvailableTask(
 
     private fun start(listener: OnSuccessListener?) {
         pollingJob = scope.launch {
+            // Monotonic, so a wall-clock adjustment mid-startup cannot extend the wait.
+            val deadline = SystemClock.elapsedRealtime() + POLL_DEADLINE_MS
             while (isActive) {
+                if (SystemClock.elapsedRealtime() >= deadline) {
+                    // The core is local, so it either comes up promptly or not at all.
+                    // Retrying a GUI that answers with 401/404 forever would leave the
+                    // service in STARTING for the lifetime of the process.
+                    Log.w(TAG, "Web GUI did not become available within $POLL_DEADLINE_MS ms")
+                    if (!cancelled) {
+                        onTimeout("Web GUI did not become available within $POLL_DEADLINE_MS ms")
+                    }
+                    return@launch
+                }
                 try {
                     val result = suspendPerformRequest()
                     if (!cancelled) {
@@ -51,7 +66,7 @@ class PollWebGuiAvailableTask(
                     }
                     return@launch
                 } catch (e: ConnectException) {
-                    delay(currentBackoffMs)
+                    delay(currentBackoffMs.milliseconds)
                     currentBackoffMs = (currentBackoffMs * 2).coerceAtMost(MAX_BACKOFF_MS)
                     logIncidence++
                     if (logIncidence == 1 || logIncidence % 10 == 0) {
@@ -60,7 +75,7 @@ class PollWebGuiAvailableTask(
                 } catch (e: Exception) {
                     if (e is CancellationException) throw e
                     Log.w(TAG, "Unexpected error while polling web gui", e)
-                    delay(currentBackoffMs)
+                    delay(currentBackoffMs.milliseconds)
                     currentBackoffMs = (currentBackoffMs * 2).coerceAtMost(MAX_BACKOFF_MS)
                 }
             }
@@ -112,5 +127,11 @@ class PollWebGuiAvailableTask(
     companion object {
         private const val INITIAL_BACKOFF_MS: Long = 150
         private const val MAX_BACKOFF_MS: Long = 10_000
+
+        /**
+         * How long the whole poll may take before startup is declared failed. The core is
+         * a process on this device, so this only has to cover loading the database.
+         */
+        private const val POLL_DEADLINE_MS: Long = 120_000
     }
 }

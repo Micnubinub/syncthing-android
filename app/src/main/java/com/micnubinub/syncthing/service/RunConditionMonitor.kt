@@ -11,7 +11,6 @@ import android.content.res.Resources
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
-import android.net.NetworkRequest
 import android.net.wifi.WifiInfo
 import android.net.wifi.WifiManager
 import android.os.BatteryManager
@@ -37,8 +36,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import javax.inject.Inject
+import kotlin.time.Duration.Companion.milliseconds
 
 /**
  * Holds information about the current wifi and charging state of the device.
@@ -95,20 +96,29 @@ class RunConditionMonitor(
         coroutineScope.launch { updateShouldRunDecision() }
     }
 
+    /**
+     * ConnectivityManager delivers these callbacks on its own ConnectivityThread, while
+     * every other writer of the run-condition state (the bus collector, the receivers,
+     * [syncStatusObserver]) is confined to [coroutineScope] on Main. Calling
+     * [updateShouldRunDecision] straight from the callback mutated [lastDeterminedShouldRun],
+     * [timeConditionMatch] and [runAllowedStopScheduled] from two threads and invoked the
+     * listeners off-main, so the decision was handed to the scope, exactly as
+     * [syncStatusObserver] does.
+     */
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
-            updateShouldRunDecision()
+            coroutineScope.launch { updateShouldRunDecision() }
         }
 
         override fun onLost(network: Network) {
-            updateShouldRunDecision()
+            coroutineScope.launch { updateShouldRunDecision() }
         }
 
         override fun onCapabilitiesChanged(
             network: Network,
             networkCapabilities: NetworkCapabilities
         ) {
-            updateShouldRunDecision()
+            coroutineScope.launch { updateShouldRunDecision() }
         }
     }
 
@@ -124,14 +134,7 @@ class RunConditionMonitor(
          * Register broadcast receivers.
          */
         // NetworkCallback to get notified of network availability and capability changes.
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            connectivityManager.registerDefaultNetworkCallback(networkCallback)
-        } else {
-            connectivityManager.registerNetworkCallback(
-                NetworkRequest.Builder().build(),
-                networkCallback
-            )
-        }
+        connectivityManager.registerDefaultNetworkCallback(networkCallback)
         networkCallbackRegistered = true
 
         // BatteryReceiver
@@ -751,15 +754,9 @@ class RunConditionMonitor(
     private val isMeteredNetworkConnection: Boolean
         get() {
             val networkCapabilities = activeNetworkCapabilities ?: return false
-            if (networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) {
-                /**
-                 * We treat Wi-Fi and ETHERNET as "Wi-Fi" connection.
-                 * Assume ETHERNET connection is un-metered to allow syncing on
-                 * Android TV or VirtualBox ETHERNET connection.
-                 */
-                return false
-            }
-            return !networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+            return !networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) && !networkCapabilities.hasCapability(
+                NetworkCapabilities.NET_CAPABILITY_NOT_METERED
+            )
         }
 
     private val isMobileDataConnection: Boolean
@@ -859,9 +856,15 @@ class RunConditionMonitor(
                 // Delay the re-evaluation so the battery status can settle, without
                 // blocking the main thread (SystemClock.sleep here would risk an ANR).
                 val pendingResult = goAsync()
+                if (!coroutineScope.isActive) {
+                    // A cancelled scope would never run the finally below, leaving the
+                    // BroadcastReceiver holding the process awake until the system times out.
+                    pendingResult.finish()
+                    return
+                }
                 coroutineScope.launch {
                     try {
-                        delay(5000)
+                        delay(5000.milliseconds)
                         updateShouldRunDecision()
                     } finally {
                         pendingResult.finish()

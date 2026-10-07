@@ -12,9 +12,11 @@ import com.google.common.reflect.TypeToken
 import com.google.gson.Gson
 import com.google.gson.GsonBuilder
 import com.google.gson.JsonElement
+import com.google.gson.JsonObject
 import com.google.gson.JsonParser.parseString
 import com.micnubinub.syncthing.SyncthingApp
 import com.micnubinub.syncthing.activities.ShareActivity
+import com.micnubinub.syncthing.http.ApiError
 import com.micnubinub.syncthing.http.ApiRequest
 import com.micnubinub.syncthing.http.EventsPoller
 import com.micnubinub.syncthing.http.GetRequest
@@ -49,52 +51,118 @@ import com.micnubinub.syncthing.model.SystemVersion
 import com.micnubinub.syncthing.service.AppPrefs.getPrefVerboseLog
 import com.micnubinub.syncthing.service.Constants.DYN_PREF_OBJECT_CUSTOM_SYNC_CONDITIONS
 import com.micnubinub.syncthing.service.Constants.ENABLE_TEST_DATA
+import com.micnubinub.syncthing.service.RestApi.Companion.STARTUP_SNAPSHOT_DEADLINE_MS
 import com.micnubinub.syncthing.util.FileUtils.syncthingTildeAbsolutePath
 import com.micnubinub.syncthing.util.Util.FOLDERS_COMPARATOR
 import com.micnubinub.syncthing.util.Util.getSyncConflictFiles
 import com.micnubinub.syncthing.util.Util.localZonedDateTime
 import com.micnubinub.syncthing.util.Util.runScriptSet
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
 import java.net.MalformedURLException
 import java.net.URL
 import java.util.Collections
+import java.util.EnumMap
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import kotlin.math.floor
+import kotlin.time.Duration.Companion.milliseconds
 
 /**
  * Provides functions to interact with the syncthing REST API.
  */
 class RestApi(
     private val context: Context,
+    /**
+     * Written by the config-save consumer when a new config moved the Web GUI, and read by
+     * every request that follows, which runs on other threads.
+     */
+    @Volatile
     private var url: URL,
     val apiKey: String?,
     apiListener: OnApiAvailableListener,
-    configListener: OnConfigChangedListener
+    configListener: OnConfigChangedListener,
+    /**
+     * Told when the startup handshake of the current generation failed, see
+     * [readConfigFromRestApi]. The owner must terminate what it started rather than sit
+     * in STARTING with no usable core.
+     */
+    private val onStartupFailedListener: (String) -> Unit = {}
 ) {
     /**
-     * Object that must be locked upon accessing the following variables:
-     * asyncQueryConfigComplete, asyncQueryVersionComplete, asyncQuerySystemStatusComplete
+     * Object that must be locked upon accessing [startupGeneration] and [startupResults].
      */
     private val asyncQueryCompleteLock = Any()
+
+    /**
+     * Monotonic id of the current startup handshake, bumped by every
+     * [readConfigFromRestApi]. Results that arrive from an abandoned generation are
+     * dropped instead of completing or failing the one that replaced it.
+     */
+    private var startupGeneration = 0L
+
+    /**
+     * Whether each snapshot of [startupGeneration] succeeded, absent until it reports.
+     * A snapshot that failed stays failed: activating on a failed one would hand the UI
+     * a config that was never loaded.
+     */
+    private val startupResults =
+        EnumMap<StartupSnapshot, Boolean>(StartupSnapshot::class.java)
+
+    /**
+     * The three snapshots that make up a startup handshake, see [readConfigFromRestApi].
+     */
+    private enum class StartupSnapshot { VERSION, CONFIG, SYSTEM_STATUS }
 
     /**
      * Object that must be locked upon accessing config
      */
     private val configLock = Any()
+
+    /**
+     * One config snapshot waiting to be delivered to the core, plus the result the
+     * waiter is suspended on.
+     */
+    private class PendingConfigSave(
+        val jsonConfig: String,
+        val completion: CompletableDeferred<ConfigSaveResult>
+    )
+
+    /**
+     * Serializes config writes. Two overlapping POSTs to /rest/system/config can reach
+     * the core out of order, which would leave it with the older config, so every save
+     * goes through this single-consumer queue.
+     */
+    private val configSaveQueue = Channel<PendingConfigSave>(Channel.UNLIMITED)
+
+    /**
+     * Delivers queued config saves in the order they were taken. Separate from [scope],
+     * which [shutdown] cancels for unrelated polling.
+     */
+    private val configSaveScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /**
+     * Saves whose completion is still awaited, so [shutdown] can release them.
+     */
+    private val pendingConfigSaves =
+        ConcurrentHashMap.newKeySet<CompletableDeferred<ConfigSaveResult>>()
+
     private var scope: CoroutineScope
     private val onApiAvailableListener: OnApiAvailableListener
     private val onConfigChangedListener: OnConfigChangedListener
@@ -131,9 +199,13 @@ class RestApi(
     val folderStateChanged: SharedFlow<Unit> = _folderStateChanged
 
     /**
-     * Results cached from systemInfo
+     * Results cached from systemInfo, written on the main thread when the startup snapshot
+     * completes and read from whichever thread asks for the local device.
      */
+    @Volatile
     private var localDeviceId: String? = null
+
+    @Volatile
     private var urVersionMax: Int = 0
 
     /**
@@ -155,12 +227,42 @@ class RestApi(
      * [../activities] needs cached config and system information available.
      * e.g. SettingsFragment need "localDeviceId"
      */
-    private var asyncQueryConfigComplete = false
-    private var asyncQueryVersionComplete = false
-    private var asyncQuerySystemStatusComplete = false
     private var lastOnlineDeviceCount = 0
     private var lastTotalSyncCompletion = -1
+
+    /**
+     * Read from the config-save consumer on [Dispatchers.IO] and written by [shutdown] on
+     * whichever thread tears the service down.
+     */
+    @Volatile
     private var hasShutdown = false
+
+    /**
+     * Timestamp of the last [GetRequest.URI_CONNECTIONS] query so [getRemoteDeviceStatus]
+     * can refresh cached connection status at a bounded rate instead of once per process.
+     * Read and written from every thread that asks for a device status.
+     */
+    @Volatile
+    private var lastConnectionStatusQueryTime: Long = 0
+
+    /**
+     * Timestamp of the last [GetRequest.URI_DB_STATUS] query per folder, and of the last
+     * event-driven write to the folder status cache. Used to refresh folder status at a
+     * bounded rate without applying a response that raced a newer event-driven write.
+     *
+     * Written from the event processor on IO and read from [getFolderStatus] on the
+     * caller's thread, so these must be concurrent maps. They cannot be [HashMap]:
+     * concurrent structural modification can spin forever or drop entries.
+     */
+    private val folderStatusQueryTime = ConcurrentHashMap<String, Long>()
+    private val folderStatusWriteTime = ConcurrentHashMap<String, Long>()
+
+    /**
+     * [ConcurrentHashMap] rejects null keys, and folder IDs are nullable throughout the
+     * model. A null ID is a single logical key, so it maps to the empty string; an empty
+     * ID is not a valid Syncthing folder ID and therefore never a real key.
+     */
+    private fun folderStatusKey(folderId: String?): String = folderId.orEmpty()
 
     val prettyPrinter = GsonBuilder().setPrettyPrinting().create()
 
@@ -172,19 +274,32 @@ class RestApi(
         localCompletion = LocalCompletion(ENABLE_VERBOSE_LOG)
         remoteCompletion = RemoteCompletion(ENABLE_VERBOSE_LOG)
         scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+        configSaveScope.launch {
+            consumeConfigSaveQueue()
+        }
     }
 
     /**
      * Gets local device ID, syncthing version and config, then calls all OnApiAvailableListeners.
+     *
+     * The handshake only succeeds when all three snapshots of this generation succeeded.
+     * Any failure, or nothing reporting before [STARTUP_SNAPSHOT_DEADLINE_MS], fails it and
+     * reports through [onStartupFailedListener] so the service can tear down instead of
+     * activating on partial data or waiting forever.
      */
     fun readConfigFromRestApi() {
         Trace.beginSection("RestApi.readConfigFromRestApi")
         try {
             LogV("Querying config from REST ...")
+            val generation: Long
             synchronized(asyncQueryCompleteLock) {
-                asyncQueryVersionComplete = false
-                asyncQueryConfigComplete = false
-                asyncQuerySystemStatusComplete = false
+                startupGeneration++
+                generation = startupGeneration
+                startupResults.clear()
+            }
+            scope.launch {
+                delay(STARTUP_SNAPSHOT_DEADLINE_MS.milliseconds)
+                failStartup(generation, "Startup snapshots did not all report in time")
             }
             GetRequest(
                 context,
@@ -193,22 +308,24 @@ class RestApi(
                 apiKey,
                 null,
                 { result: String? ->
-                    val json = parseString(result).getAsJsonObject()
-                    version = json.get("version").asString
-                    updateDebugFacilitiesCache()
-                    synchronized(asyncQueryCompleteLock) {
-                        asyncQueryVersionComplete = true
-                        checkReadConfigFromRestApiCompleted()
+                    val parsedVersion = try {
+                        parseString(result).getAsJsonObject().get("version").asString
+                    } catch (e: Exception) {
+                        if (e is CancellationException) throw e
+                        Log.e(TAG, "readConfigFromRestApi: Failed to read version: $e")
+                        null
+                    }
+                    if (parsedVersion == null) {
+                        completeStartupSnapshot(generation, StartupSnapshot.VERSION, false)
+                    } else {
+                        version = parsedVersion
+                        updateDebugFacilitiesCache()
+                        completeStartupSnapshot(generation, StartupSnapshot.VERSION, true)
                     }
                 },
                 { error ->
-                    // Fail fast instead of leaving the startup handshake stuck in
-                    // STATE.STARTING forever when the version request fails.
                     Log.e(TAG, "readConfigFromRestApi: Failed to load version: $error")
-                    synchronized(asyncQueryCompleteLock) {
-                        asyncQueryVersionComplete = true
-                        checkReadConfigFromRestApiCompleted()
-                    }
+                    completeStartupSnapshot(generation, StartupSnapshot.VERSION, false)
                 })
             GetRequest(
                 context,
@@ -217,60 +334,86 @@ class RestApi(
                 apiKey,
                 null,
                 { result: String? ->
-                    onReloadConfigComplete(result) {
-                        synchronized(asyncQueryCompleteLock) {
-                            asyncQueryConfigComplete = true
-                            checkReadConfigFromRestApiCompleted()
-                        }
+                    onReloadConfigComplete(result) { loaded ->
+                        completeStartupSnapshot(generation, StartupSnapshot.CONFIG, loaded)
                     }
                 },
                 { error ->
-                    // Fail fast instead of leaving the startup handshake stuck in
-                    // STATE.STARTING forever when the config request fails.
                     Log.e(TAG, "readConfigFromRestApi: Failed to load config: $error")
-                    synchronized(asyncQueryCompleteLock) {
-                        asyncQueryConfigComplete = true
-                        checkReadConfigFromRestApiCompleted()
-                    }
+                    completeStartupSnapshot(generation, StartupSnapshot.CONFIG, false)
                 })
             getSystemStatus(
                 { info: SystemStatus? ->
                     localDeviceId = info?.myID
                     urVersionMax = info?.urVersionMax ?: 0
-                    synchronized(asyncQueryCompleteLock) {
-                        asyncQuerySystemStatusComplete = true
-                        checkReadConfigFromRestApiCompleted()
-                    }
+                    completeStartupSnapshot(generation, StartupSnapshot.SYSTEM_STATUS, true)
                 },
                 { error ->
-                    // Fail fast instead of leaving the startup handshake stuck in
-                    // STATE.STARTING forever when the status request fails.
                     Log.e(TAG, "readConfigFromRestApi: Failed to load system status: $error")
-                    synchronized(asyncQueryCompleteLock) {
-                        asyncQuerySystemStatusComplete = true
-                        checkReadConfigFromRestApiCompleted()
-                    }
+                    completeStartupSnapshot(generation, StartupSnapshot.SYSTEM_STATUS, false)
                 })
         } finally {
             Trace.endSection()
         }
     }
 
-    private fun checkReadConfigFromRestApiCompleted() {
-        if (asyncQueryVersionComplete &&
-            asyncQueryConfigComplete &&
-            asyncQuerySystemStatusComplete
-        ) {
-            LogV("Reading config from REST completed. Syncthing version is $version")
-            // Tell SyncthingService it can transition to State.ACTIVE.
-            onApiAvailableListener.onApiAvailable()
-
-            // Apply a pending cleanup-interval restore from a previous run that
-            // was killed before its delayed restore could execute, then possibly
-            // start a fresh cleanup cycle (triggers only every 10th startup).
-            restoreVersioningCleanupFromPending()
-            triggerVersioningCleanupIfNecessary()
+    /**
+     * Records the outcome of one startup snapshot and, once every snapshot of
+     * [generation] has reported, either activates the service or fails the startup.
+     */
+    private fun completeStartupSnapshot(
+        generation: Long,
+        snapshot: StartupSnapshot,
+        succeeded: Boolean
+    ) {
+        val allReported: Boolean
+        val allSucceeded: Boolean
+        synchronized(asyncQueryCompleteLock) {
+            if (generation != startupGeneration) {
+                Log.w(
+                    TAG,
+                    "completeStartupSnapshot: ignoring $snapshot from superseded generation $generation"
+                )
+                return
+            }
+            startupResults[snapshot] = succeeded
+            allReported = StartupSnapshot.entries.all { startupResults.containsKey(it) }
+            allSucceeded = StartupSnapshot.entries.all { startupResults[it] == true }
         }
+        if (!allReported) {
+            return
+        }
+        if (!allSucceeded) {
+            failStartup(generation, "Not all startup snapshots could be read")
+            return
+        }
+        LogV("Reading config from REST completed. Syncthing version is $version")
+        // Tell SyncthingService it can transition to State.ACTIVE.
+        onApiAvailableListener.onApiAvailable()
+
+        // Apply a pending cleanup-interval restore from a previous run that
+        // was killed before its delayed restore could execute, then possibly
+        // start a fresh cleanup cycle (triggers only every 10th startup).
+        restoreVersioningCleanupFromPending()
+        triggerVersioningCleanupIfNecessary()
+    }
+
+    /**
+     * Fails the startup handshake of [generation], telling the service to terminate what
+     * it owns. A generation that already reported is left alone, so the success path is
+     * never undone.
+     */
+    private fun failStartup(generation: Long, reason: String) {
+        synchronized(asyncQueryCompleteLock) {
+            if (generation != startupGeneration) {
+                return
+            }
+            // Mark every snapshot as reported so a late result cannot activate the core
+            // after this point.
+            StartupSnapshot.entries.forEach { startupResults.putIfAbsent(it, false) }
+        }
+        Log.e(TAG, "readConfigFromRestApi: $reason")
+        onStartupFailedListener(reason)
     }
 
     private fun triggerVersioningCleanupIfNecessary() {
@@ -303,7 +446,7 @@ class RestApi(
         // Temporarily lower cleanupIntervalS for every folder to force cleanup after startup.
         setVersioningCleanupIntervalS(2)
         scope.launch {
-            delay(10_000L)
+            delay(10_000L.milliseconds)
             restoreVersioningCleanupFromPending()
         }
     }
@@ -338,7 +481,7 @@ class RestApi(
         }
 
         if (restoreMap.isNullOrEmpty()) {
-            sharedPreferences.edit().remove(Constants.PREF_VERSIONING_CLEANUP_RESTORE).apply()
+            sharedPreferences.edit { remove(Constants.PREF_VERSIONING_CLEANUP_RESTORE) }
             return
         }
 
@@ -356,10 +499,10 @@ class RestApi(
             }
             if (changed) {
                 LogV("Restored VersioningCleanupIntervalS to the user's original values")
-                sendConfig()
+                queueConfigSave()
             }
         }
-        sharedPreferences.edit().remove(Constants.PREF_VERSIONING_CLEANUP_RESTORE).apply()
+        sharedPreferences.edit { remove(Constants.PREF_VERSIONING_CLEANUP_RESTORE) }
     }
 
     fun reloadConfig() {
@@ -374,19 +517,22 @@ class RestApi(
         )
     }
 
-    private fun onReloadConfigComplete(configResult: String?, onReady: (() -> Unit)? = null) {
+    private fun onReloadConfigComplete(
+        configResult: String?,
+        onReady: ((loaded: Boolean) -> Unit)? = null
+    ) {
         scope.launch(Dispatchers.IO) {
             val parsedConfig = try {
                 gson.fromJson(configResult, Config::class.java)
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
                 Log.e(TAG, "onReloadConfigComplete: Failed to parse config", e)
-                onReady?.invoke()
+                onReady?.invoke(false)
                 return@launch
             }
             if (parsedConfig == null) {
                 Log.e(TAG, "onReloadConfigComplete: config is null: $configResult")
-                onReady?.invoke()
+                onReady?.invoke(false)
                 return@launch
             }
             synchronized(configLock) {
@@ -409,7 +555,7 @@ class RestApi(
                 }
             }
 
-            onReady?.invoke()
+            onReady?.invoke(true)
 
             GetRequest(
                 context,
@@ -419,16 +565,16 @@ class RestApi(
                         Log.e(TAG, "ORCC: URI_PENDING_DEVICES, result == null")
                         return@OnSuccessListener
                     }
-                    val jsonObject = parseString(result).getAsJsonObject()
+                    val jsonObject = parseJsonObjectOrNull(result)
                     if (jsonObject == null) {
-                        Log.e(TAG, "ORCC: URI_PENDING_DEVICES, jsonObject == null")
+                        Log.e(TAG, "ORCC: URI_PENDING_DEVICES, result is not a JSON object")
                         return@OnSuccessListener
                     }
                     val entries = jsonObject.entrySet()
-                    for (deviceEntry in entries) {
-                        val resultDeviceId = deviceEntry.key ?: continue
+                    for ((key, value) in entries) {
+                        val resultDeviceId = key ?: continue
                         val pendingDevice =
-                            gson.fromJson(deviceEntry.value, PendingDevice::class.java)
+                            gson.fromJson(value, PendingDevice::class.java)
                         Log.d(
                             TAG,
                             "ORCC: resultDeviceId = " + resultDeviceId + "('" + pendingDevice.name + "')"
@@ -515,9 +661,9 @@ class RestApi(
                     Log.e(TAG, "ORCC: URI_PENDING_FOLDERS, result == null")
                     return@OnSuccessListener
                 }
-                val jsonObject = parseString(result).getAsJsonObject()
+                val jsonObject = parseJsonObjectOrNull(result)
                 if (jsonObject == null) {
-                    Log.e(TAG, "ORCC: URI_PENDING_FOLDERS, jsonObject == null")
+                    Log.e(TAG, "ORCC: URI_PENDING_FOLDERS, result is not a JSON object")
                     return@OnSuccessListener
                 }
                 val entries = jsonObject.entrySet()
@@ -608,19 +754,19 @@ class RestApi(
      * Ignored devices will not trigger the "DeviceRejected" event
      * in [EventProcessor.onEvent].
      */
-    fun ignoreDevice(
+    suspend fun ignoreDevice(
         deviceId: String,
         deviceName: String,
         deviceAddress: String
-    ) {
-        synchronized(configLock) {
+    ): ConfigSaveResult {
+        val completion = synchronized(configLock) {
             // Check if the device has already been ignored.
             config?.remoteIgnoredDevices?.let {
                 for (remoteIgnoredDevice in it) {
                     if (deviceId == remoteIgnoredDevice?.deviceID) {
                         // Device already ignored.
                         Log.d(TAG, "Device already ignored [$deviceId]")
-                        return
+                        return@synchronized null
                     }
                 }
             }
@@ -635,9 +781,10 @@ class RestApi(
             remoteIgnoredDevice.name = deviceName
             remoteIgnoredDevice.time = localZonedDateTime
             config?.remoteIgnoredDevices?.add(remoteIgnoredDevice)
-            sendConfig()
-            Log.d(TAG, "Ignored device [$deviceId]")
+            queueConfigSaveLocked()
         }
+        Log.d(TAG, "Ignored device [$deviceId]")
+        return completion?.await() ?: ConfigSaveResult.SKIPPED
     }
 
     /**
@@ -645,11 +792,12 @@ class RestApi(
      * Ignored folders will not trigger the "FolderRejected" event
      * in [EventProcessor.onEvent].
      */
-    fun ignoreFolder(
+    suspend fun ignoreFolder(
         deviceId: String,
         folderId: String,
         folderLabel: String
-    ) {
+    ): ConfigSaveResult {
+        var completion: CompletableDeferred<ConfigSaveResult>? = null
         synchronized(configLock) {
             config?.devices?.let { devices ->
                 for (device in devices) {
@@ -658,14 +806,14 @@ class RestApi(
                          * Check if the folder has already been ignored.
                          */
                         device.ignoredFolders?.let {
-                            for (ignoredFolder in it) {
-                                if (folderId == ignoredFolder.id) {
+                            for ((id) in it) {
+                                if (folderId == id) {
                                     // Folder already ignored.
                                     Log.d(
                                         TAG,
                                         "ignoreFolder: Folder [$folderId] already ignored on device [$deviceId]"
                                     )
-                                    return
+                                    return@synchronized
                                 }
                             }
                         }
@@ -681,34 +829,33 @@ class RestApi(
                         ignoredFolder.time = localZonedDateTime
                         device.ignoredFolders?.add(ignoredFolder)
                         LogV("ignoreFolder: device.getIgnoredFolders() = " + gson.toJson(device.ignoredFolders))
-                        sendConfig()
-                        Log.d(
-                            TAG,
-                            "Ignored folder [$folderId] announced by device [$deviceId]"
-                        )
+                        completion = queueConfigSaveLocked()
 
                         // Given deviceId handled.
                         break
                     }
                 }
             }
-
         }
+        Log.d(TAG, "Ignored folder [$folderId] announced by device [$deviceId]")
+        return completion?.await() ?: ConfigSaveResult.SKIPPED
     }
 
     /**
      * Undo ignoring devices and folders.
      */
-    fun undoIgnoredDevicesAndFolders() {
+    suspend fun undoIgnoredDevicesAndFolders(): ConfigSaveResult {
         Log.d(TAG, "Undo ignoring devices and folders ...")
-        synchronized(configLock) {
+        val completion = synchronized(configLock) {
             config?.remoteIgnoredDevices?.clear()
             config?.devices?.let {
                 for (device in it) {
                     device.ignoredFolders?.clear()
                 }
             }
+            queueConfigSaveLocked()
         }
+        return completion.await()
     }
 
     /**
@@ -731,29 +878,40 @@ class RestApi(
     /**
      * Rescan all folders
      */
-    fun rescanAll() {
+    suspend fun rescanAll(): Boolean {
         Log.d(TAG, "rescanAll")
-        PostRequest(
-            context, url, PostRequest.URI_DB_SCAN, apiKey,
-            null, null, null
-        )
+        return postAndReport("rescanAll", PostRequest.URI_DB_SCAN, null)
     }
 
     /**
      * Revert local folder changes. This is the same as hitting
      * the "Revert local changes" button from the web UI.
      */
-    fun revertLocalChanges(folderId: String?) {
+    suspend fun revertLocalChanges(folderId: String?): Boolean {
         Log.d(TAG, "revertLocalChanges '$folderId'")
-        PostRequest(
-            context,
-            url,
-            PostRequest.URI_DB_REVERT,
-            apiKey,
-            mutableMapOf("folder" to folderId),
-            null,
-            null
+        return postAndReport(
+            "revertLocalChanges", PostRequest.URI_DB_REVERT, mutableMapOf("folder" to folderId)
         )
+    }
+
+    /**
+     * Issues a POST and suspends until the core has answered, so a caller that reports an
+     * action as done cannot do so for a request that never arrived.
+     *
+     * @return whether the core accepted the request.
+     */
+    private suspend fun postAndReport(
+        what: String,
+        path: String,
+        params: MutableMap<String, String?>?,
+        postBody: String? = null
+    ): Boolean {
+        val result = PostRequest.postAndAwait(context, url, path, apiKey, params, postBody)
+        if (result is ApiRequest.ApiResult.Failure) {
+            Log.e(TAG, "$what: The core did not accept the request: ${result.error}")
+            return false
+        }
+        return true
     }
 
     val webGuiUrl: URL
@@ -777,22 +935,112 @@ class RestApi(
         }
 
     /**
-     * Sends current config to Syncthing.
+     * Sends current config to Syncthing and suspends until Syncthing has accepted it.
      * Will result in a "ConfigSaved" event.
      * EventProcessor will trigger reloadConfig().
+     *
+     * Saves are serialized through [configSaveQueue], so a mutation made while an earlier
+     * save is in flight cannot overtake it and leave the core with the older config.
+     *
+     * @return [ConfigSaveResult.SAVED] only once the core has the new config. On anything
+     * else no reload is triggered, so the UI keeps showing the config that is actually
+     * live and the caller can report the failure or roll back.
      */
-    fun sendConfig() {
-        val jsonConfig: String?
-        synchronized(configLock) {
-            jsonConfig = gson.toJson(config)
+    suspend fun sendConfig(): ConfigSaveResult {
+        val completion = synchronized(configLock) { queueConfigSaveLocked() }
+        return completion.await()
+    }
+
+    /**
+     * Result of a config mutation, see [sendConfig].
+     */
+    enum class ConfigSaveResult {
+        /**
+         * Syncthing has the new config.
+         */
+        SAVED,
+
+        /**
+         * The config was not written, so it is unchanged and must not be reported as saved.
+         */
+        FAILED,
+
+        /**
+         * The core is going away, so the change was neither written nor lost silently:
+         * it is still in the model and is saved on the next start.
+         */
+        SKIPPED
+    }
+
+    /**
+     * Snapshots the current config and hands it to [configSaveQueue], so that overlapping
+     * mutations cannot deliver an older snapshot after a newer one.
+     *
+     * Snapshotting and enqueueing happen together because a save that is queued before an
+     * intervening mutation would otherwise overwrite it on the core.
+     *
+     * Call this with [configLock] held.
+     */
+    private fun queueConfigSaveLocked(): CompletableDeferred<ConfigSaveResult> {
+        val completion = CompletableDeferred<ConfigSaveResult>()
+        val queued = configSaveQueue.trySend(PendingConfigSave(gson.toJson(config), completion))
+        if (queued.isFailure) {
+            // The queue is closed, i.e. the core is shutting down.
+            completion.complete(ConfigSaveResult.SKIPPED)
+        } else {
+            pendingConfigSaves.add(completion)
         }
-        // LogVMultipleLines("sendConfig: config=" + jsonToPrettyFormat(jsonConfig));
-        PostRequest(
+        return completion
+    }
+
+    /**
+     * For internal mutations whose outcome nobody reports. The reload still only happens
+     * once the core has accepted the write.
+     */
+    private fun queueConfigSave() {
+        synchronized(configLock) {
+            queueConfigSaveLocked()
+        }
+    }
+
+    /**
+     * Runs the single save-queue consumer for the lifetime of this [RestApi].
+     */
+    private suspend fun consumeConfigSaveQueue() {
+        for (save in configSaveQueue) {
+            save.completion.complete(deliverConfigSave(save))
+            pendingConfigSaves.remove(save.completion)
+        }
+    }
+
+    /**
+     * Posts one config snapshot and reports what the core made of it. Runs on the single
+     * save-queue consumer, so the snapshots reach the core in the order they were taken.
+     */
+    private suspend fun deliverConfigSave(save: PendingConfigSave): ConfigSaveResult {
+        if (hasShutdown) {
+            return ConfigSaveResult.SKIPPED
+        }
+        val result = PostRequest.postAndAwait(
             context, url, PostRequest.URI_SYSTEM_CONFIG, apiKey,
-            null, jsonConfig, null
+            postBody = save.jsonConfig
         )
-        url = webGuiUrl
-        onConfigChangedListener.onConfigChanged()
+        return when (result) {
+            is ApiRequest.ApiResult.Success -> {
+                url = webGuiUrl
+                // Only now is the new config authoritative, so only now do listeners reload.
+                onConfigChangedListener.onConfigChanged()
+                ConfigSaveResult.SAVED
+            }
+
+            is ApiRequest.ApiResult.Failure -> {
+                Log.e(
+                    TAG,
+                    "deliverConfigSave: Syncthing did not accept the new config: ${result.error}"
+                )
+                ConfigSaveResult.FAILED
+            }
+        }
     }
 
     /**
@@ -803,10 +1051,27 @@ class RestApi(
         hasShutdown = true
         stopEventStream()
         scope.cancel()
-        PostRequest(
-            context, url, PostRequest.URI_SYSTEM_SHUTDOWN, apiKey,
-            null, null, null
-        )
+        // Nothing the core has not already answered can still succeed now, so end the
+        // outstanding requests instead of letting them occupy a dispatcher thread each
+        // until they time out. This runs before the shutdown POST below, which is
+        // created afterwards and therefore still reaches the core.
+        SyncthingHttpClients.cancelInFlightCalls()
+
+        // The core is going away, so a queued config save can no longer be delivered.
+        // Release every waiter instead of leaving it suspended for good.
+        configSaveQueue.close()
+        configSaveScope.cancel()
+        pendingConfigSaves.forEach { it.complete(ConfigSaveResult.SKIPPED) }
+        pendingConfigSaves.clear()
+
+        // Bounded: a wedged core must not hold the caller here indefinitely. The
+        // caller force-terminates the process on timeout, so a missing request is
+        // recoverable.
+        withTimeoutOrNull(SHUTDOWN_REQUEST_TIMEOUT_MS.milliseconds) {
+            PostRequest.postAndAwait(
+                context, url, PostRequest.URI_SYSTEM_SHUTDOWN, apiKey
+            )
+        } ?: Log.w(TAG, "shutdown: Syncthing did not acknowledge the shutdown request")
     }
 
     /**
@@ -814,10 +1079,17 @@ class RestApi(
      * All caches are repopulated lazily on the next query.
      */
     fun clearCaches() {
-        localCompletion.folderMap.clear()
-        remoteCompletion.deviceFolderMap.clear()
+        // Both models are written from the event processor on IO, so they must be
+        // cleared through the lock-owning methods, not by clearing the maps here.
+        localCompletion.clear()
+        remoteCompletion.clear()
         previousConnections = Optional.absent()
         previousConnectionTime = 0
+        // The rate limiters are keyed by folder, so they would otherwise keep a
+        // stale entry per folder for the rest of the process lifetime and suppress
+        // the first query after the cache drop.
+        folderStatusQueryTime.clear()
+        folderStatusWriteTime.clear()
     }
 
     val folders: List<Folder>
@@ -863,33 +1135,36 @@ class RestApi(
     /**
      * This is only used for new folder creation, see [../activities].
      */
-    fun addFolder(folder: Folder) {
-        synchronized(configLock) {
+    suspend fun addFolder(folder: Folder): ConfigSaveResult {
+        val completion = synchronized(configLock) {
             // Add the new folder to the model.
             config?.folders?.add(folder)
             // Send model changes to syncthing, does not require a restart.
-            sendConfig()
+            queueConfigSaveLocked()
         }
+        return completion.await()
     }
 
-    fun updateFolder(newFolder: Folder) {
-        synchronized(configLock) {
+    suspend fun updateFolder(newFolder: Folder): ConfigSaveResult {
+        val completion = synchronized(configLock) {
             removeFolderInternal(newFolder.id)
             config?.folders?.add(newFolder)
-            sendConfig()
+            queueConfigSaveLocked()
         }
+        return completion.await()
     }
 
-    fun removeFolder(id: String?) {
-        synchronized(configLock) {
+    suspend fun removeFolder(id: String?): ConfigSaveResult {
+        val completion = synchronized(configLock) {
             removeFolderInternal(id)
             // localCompletion will be updated after the ConfigSaved event.
             // remoteCompletion will be updated after the ConfigSaved event.
-            sendConfig()
+            queueConfigSaveLocked()
         }
         PreferenceManager.getDefaultSharedPreferences(context).edit {
             remove(ShareActivity.PREF_FOLDER_SAVED_SUBDIRECTORY + id)
         }
+        return completion.await()
     }
 
     private fun removeFolderInternal(id: String?) {
@@ -919,7 +1194,7 @@ class RestApi(
         }
 
         val it = devices.iterator()
-        while (it.hasNext() == true) {
+        while (it.hasNext()) {
             val device = it.next()
             val isLocalDevice = Objects.equal(localDeviceId, device.deviceID)
             if (!includeLocal && isLocalDevice) {
@@ -933,7 +1208,7 @@ class RestApi(
     val localDevice: Device?
         get() {
             val devices = getDevices(true)
-            if (devices.isNullOrEmpty()) {
+            if (devices.isEmpty()) {
                 return null
             }
             LogV("getLocalDevice: Looking for local device ID $localDeviceId")
@@ -948,20 +1223,22 @@ class RestApi(
     /**
      * Adds or updates a device identified by its device ID.
      */
-    fun updateDevice(newDevice: Device) {
-        synchronized(configLock) {
+    suspend fun updateDevice(newDevice: Device): ConfigSaveResult {
+        val completion = synchronized(configLock) {
             removeDeviceInternal(newDevice.deviceID)
             config?.devices?.add(newDevice)
-            sendConfig()
+            queueConfigSaveLocked()
         }
+        return completion.await()
     }
 
-    fun removeDevice(deviceId: String) {
-        synchronized(configLock) {
+    suspend fun removeDevice(deviceId: String): ConfigSaveResult {
+        val completion = synchronized(configLock) {
             removeDeviceInternal(deviceId)
             // remoteCompletion will be updated after the ConfigSaved event.
-            sendConfig()
+            queueConfigSaveLocked()
         }
+        return completion.await()
     }
 
     private fun removeDeviceInternal(deviceId: String?) {
@@ -991,18 +1268,36 @@ class RestApi(
             }
         }
 
-    fun editSettings(newGui: Gui?, newOptions: Options?) {
-        synchronized(configLock) {
+    /**
+     * Applies GUI/options edits together with a local device rename, so that a single
+     * config write carries all of them. [newLocalDevice] may be null while the config is
+     * still loading.
+     *
+     * @return [ConfigSaveResult.SAVED] only once the core has the new config.
+     */
+    suspend fun editSettings(
+        newGui: Gui?,
+        newOptions: Options?,
+        newLocalDevice: Device?
+    ): ConfigSaveResult {
+        val completion = synchronized(configLock) {
             config?.gui = newGui
             config?.options = newOptions
+            newLocalDevice?.let { device ->
+                removeDeviceInternal(device.deviceID)
+                config?.devices?.add(device)
+            }
+            queueConfigSaveLocked()
         }
+        return completion.await()
     }
 
-    fun updateGui(newGui: Gui?) {
-        synchronized(configLock) {
+    suspend fun updateGui(newGui: Gui?): ConfigSaveResult {
+        val completion = synchronized(configLock) {
             config?.gui = newGui
-            sendConfig()
+            queueConfigSaveLocked()
         }
+        return completion.await()
     }
 
     /**
@@ -1016,12 +1311,20 @@ class RestApi(
             context,
             url, GetRequest.URI_SYSTEM_STATUS,
             apiKey, null, { result: String? ->
-                val systemStatus: SystemStatus?
-                try {
-                    systemStatus = gson.fromJson(result, SystemStatus::class.java)
-                    listener.onResult(systemStatus)
+                val systemStatus = try {
+                    gson.fromJson(result, SystemStatus::class.java)
                 } catch (e: Exception) {
                     Log.e(TAG, "getSystemStatus: Parsing REST API result failed. result=$result")
+                    null
+                }
+                if (systemStatus == null) {
+                    // Reporting through neither listener would leave a caller that is
+                    // waiting on one of them waiting for good.
+                    errorListener?.onError(
+                        ApiError.Network(IOException("Failed to parse system status"))
+                    )
+                } else {
+                    listener.onResult(systemStatus)
                 }
             }, errorListener
         )
@@ -1041,12 +1344,18 @@ class RestApi(
         GetRequest(
             context, url, GetRequest.URI_SYSTEM_DISCOVERY, apiKey,
             null, { result: String? ->
-                val discoveredDevices = gson.fromJson<MutableMap<String, DiscoveredDevice?>>(
-                    result,
-                    object : TypeToken<MutableMap<String, DiscoveredDevice?>>() {
-                    }.type
-                )
-                if (ENABLE_TEST_DATA) {
+                val discoveredDevices = try {
+                    gson.fromJson<MutableMap<String, DiscoveredDevice?>>(
+                        result,
+                        object : TypeToken<MutableMap<String, DiscoveredDevice?>>() {
+                        }.type
+                    )
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                    Log.e(TAG, "getDiscoveredDevices: Failed to parse the REST API result")
+                    null
+                }
+                if (ENABLE_TEST_DATA && discoveredDevices != null) {
                     val fakeDiscoveredDevice = DiscoveredDevice()
                     fakeDiscoveredDevice.addresses = listOf("tcp4://192.168.178.10:40004")
                     discoveredDevices[TestData.DEVICE_A_ID] = fakeDiscoveredDevice
@@ -1059,7 +1368,7 @@ class RestApi(
     /**
      * Requests ignore list for given folder.
      */
-    fun getFolderIgnoreList(folderId: String?, listener: OnResultListener<FolderIgnoreList>) {
+    fun getFolderIgnoreList(folderId: String?, listener: OnResultListener<FolderIgnoreList?>) {
         GetRequest(
             context,
             url,
@@ -1067,8 +1376,16 @@ class RestApi(
             apiKey,
             mutableMapOf("folder" to folderId),
             { result: String ->
-                val folderIgnoreList =
+                // A null answer is how this method already reports "nothing usable"; the
+                // editor leaves the ignore list alone in that case rather than replacing
+                // it with an empty one.
+                val folderIgnoreList = try {
                     gson.fromJson(result, FolderIgnoreList::class.java)
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                    Log.e(TAG, "getFolderIgnoreList: Failed to parse the REST API result")
+                    null
+                }
                 listener.onResult(folderIgnoreList)
             },
             null
@@ -1076,19 +1393,19 @@ class RestApi(
     }
 
     /**
-     * Posts ignore list for given folder.
+     * Posts ignore list for given folder and suspends until the core has accepted it, so
+     * a screen that saves a folder can report the outcome of the whole save.
+     *
+     * @return whether the core accepted the ignore list.
      */
-    fun postFolderIgnoreList(folderId: String?, ignore: List<String>?) {
+    suspend fun postFolderIgnoreList(folderId: String?, ignore: List<String>?): Boolean {
         val folderIgnoreList = FolderIgnoreList()
         folderIgnoreList.ignore = ignore
-        PostRequest(
-            context,
-            url,
+        return postAndReport(
+            "postFolderIgnoreList",
             PostRequest.URI_DB_IGNORES,
-            apiKey,
             mutableMapOf("folder" to folderId),
-            gson.toJson(folderIgnoreList),
-            null
+            gson.toJson(folderIgnoreList)
         )
     }
 
@@ -1103,7 +1420,13 @@ class RestApi(
             apiKey,
             null,
             { result: String? ->
-                val systemVersion = gson.fromJson(result, SystemVersion::class.java)
+                val systemVersion = try {
+                    gson.fromJson(result, SystemVersion::class.java)
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                    Log.e(TAG, "getSystemVersion: Failed to parse the REST API result")
+                    null
+                }
                 listener.onResult(systemVersion)
             },
             null
@@ -1118,14 +1441,17 @@ class RestApi(
         deviceId: String?
     ): Connection? {
         val cacheEntry: Connection? = remoteCompletion.getDeviceStatus(deviceId)
-        if (cacheEntry?.at?.isEmpty() ?: true) {
+        val queryDue = System.currentTimeMillis() - lastConnectionStatusQueryTime >=
+                Constants.REST_UPDATE_INTERVAL
+        if ((cacheEntry?.at?.isEmpty() ?: true) || queryDue) {
             /**
-             * Cache miss.
+             * Cache miss or stale cached status.
              * Query the required information so it will be available on a future call to this function.
              */
             if (!deviceId.isNullOrEmpty()) {
                 LogV("getRemoteDeviceStatus: Cache miss, deviceId=\"$deviceId\". Performing query.")
             }
+            lastConnectionStatusQueryTime = System.currentTimeMillis()
             GetRequest(
                 context,
                 url, GetRequest.URI_CONNECTIONS,
@@ -1134,19 +1460,31 @@ class RestApi(
                      * We got connection status information for ALL devices instead of one.
                      * It does not hurt storing all of them.
                      */
-                    val connections = gson.fromJson(result, Connections::class.java)
-                    calculateConnectionStats(connections)
-                    connections.connections?.entries?.let {
-                        for (e in it) {
-                            e.value?.let { connection ->
-                                remoteCompletion.setDeviceStatus(
-                                    e.key,  // deviceId
-                                    connection
-                                )
-                            }
+                    val connections = try {
+                        gson.fromJson(result, Connections::class.java)
+                    } catch (e: Exception) {
+                        if (e is CancellationException) throw e
+                        Log.e(TAG, "getRemoteDeviceStatus: Failed to parse URI_CONNECTIONS")
+                        null
+                    }
+                    connections?.let {
+                        calculateConnectionStats(it)
+                        it.connections?.entries?.let { entries ->
+                            for (e in entries) {
+                                e.value?.let { connection ->
+                                    remoteCompletion.setDeviceStatus(
+                                        e.key,  // deviceId
+                                        connection
+                                    )
+                                }
 
+                            }
                         }
                     }
+                    // Connection changes now have the same notification and completion
+                    // side effects as DeviceConnected/Disconnected events, so devices that
+                    // come online are not stuck shown as disconnected.
+                    onTotalSyncCompletionChange()
 
                 }, null
             )
@@ -1162,9 +1500,12 @@ class RestApi(
                         Log.e(TAG, "getRemoteDeviceStatus: URI_STATS_DEVICE, result == null")
                         return@OnSuccessListener
                     }
-                    val jsonObject = parseString(result).getAsJsonObject()
+                    val jsonObject = parseJsonObjectOrNull(result)
                     if (jsonObject == null) {
-                        Log.e(TAG, "getRemoteDeviceStatus: URI_STATS_DEVICE, jsonObject == null")
+                        Log.e(
+                            TAG,
+                            "getRemoteDeviceStatus: URI_STATS_DEVICE, result is not a JSON object"
+                        )
                         return@OnSuccessListener
                     }
                     val entries = jsonObject.entrySet()
@@ -1299,6 +1640,8 @@ class RestApi(
                     listener.onResult(diskEvents)
                 } catch (e: Exception) {
                     Log.e(TAG, "getDiskEvents: Parsing REST API result failed. result=$result")
+                    // Reporting through neither listener would leave a caller waiting for good.
+                    listener.onResult(emptyList())
                 }
             }, null
         )
@@ -1309,9 +1652,14 @@ class RestApi(
      * [onEvent] callback is invoked for each event, together with its raw JSON
      * for handlers that need fields outside [Event].
      */
-    fun startEventStream(onEvent: (event: Event, json: JsonElement?) -> Unit) {
+    fun startEventStream(
+        onEvent: (event: Event, json: JsonElement?) -> Unit,
+        onStreamGap: (lastDeliveredId: Long, firstMissingId: Long) -> Unit =
+            { _, _ -> }
+    ) {
         stopEventStream()
-        eventStream = EventsPoller(context, url, apiKey, onEvent).also { it.start() }
+        eventStream =
+            EventsPoller(context, url, apiKey, onEvent, onStreamGap).also { it.start() }
     }
 
     fun stopEventStream() {
@@ -1326,12 +1674,18 @@ class RestApi(
         folderId: String?
     ): MutableMap.MutableEntry<FolderStatus, CachedFolderStatus> {
         val cacheEntry = localCompletion.getFolderStatus(folderId)
-        if (cacheEntry.key.stateChanged.isEmpty()) {
+        val now = System.currentTimeMillis()
+        val queryDue = now - (folderStatusQueryTime[folderStatusKey(folderId)] ?: 0L) >=
+                Constants.REST_UPDATE_INTERVAL
+        if (cacheEntry.key.stateChanged.isEmpty() || queryDue) {
             /**
-             * Cache miss because we haven't received a "FolderSummary" event yet.
+             * Cache miss because we haven't received a "FolderSummary" event yet, or the
+             * cached status has gone stale (e.g. still showing "idle" while the folder
+             * is actually scanning/syncing).
              * Query the required information so it will be available on a future call to this function.
              */
             LogV("getFolderStatus: Cache miss, folderId=\"$folderId\". Performing query.")
+            folderStatusQueryTime[folderStatusKey(folderId)] = now
             GetRequest(
                 context,
                 url,
@@ -1344,11 +1698,17 @@ class RestApi(
                         Log.e(TAG, "getFolderStatus#GetRequest#onResult: folderId == null")
                         return@OnSuccessListener
                     }
-                    localCompletion.setFolderStatus(
-                        folderId,
-                        folder.paused,
-                        gson.fromJson(result, FolderStatus::class.java)
-                    )
+                    // Ignore responses that raced a newer event-driven write, otherwise a
+                    // delayed status response could roll the folder state back (e.g. to a
+                    // stale "scanning") after an event already applied the correct state.
+                    val writeTime = folderStatusWriteTime[folderStatusKey(folderId)] ?: 0L
+                    if (writeTime <= now) {
+                        localCompletion.setFolderStatus(
+                            folderId,
+                            folder.paused,
+                            gson.fromJson(result, FolderStatus::class.java)
+                        )
+                    }
                 }
             ) { }
         }
@@ -1389,6 +1749,7 @@ class RestApi(
         folderId: String?,
         folderStatus: FolderStatus
     ) {
+        folderStatusWriteTime[folderStatusKey(folderId)] = System.currentTimeMillis()
         localCompletion.setFolderStatus(folderId, folderStatus)
         onTotalSyncCompletionChange()
         notifyFolderStateChanged()
@@ -1532,7 +1893,7 @@ class RestApi(
             if (folderRunScriptEnabled) {
                 runScriptSet(
                     folder.path + "/" + Constants.FILENAME_STFOLDER,
-                    arrayOf<String>(
+                    arrayOf(
                         "sync_complete"
                     )
                 )
@@ -1545,7 +1906,6 @@ class RestApi(
     }
 
     fun setRemoteIndexUpdated(
-        deviceId: String?,
         folderId: String?,
         remoteIndexUpdated: Boolean
     ) {
@@ -1554,6 +1914,7 @@ class RestApi(
 
     fun updateLocalFolderPause(folderId: String?, newPaused: Boolean) {
         // Clear status cache when pausing or resuming the folder.
+        folderStatusWriteTime[folderStatusKey(folderId)] = System.currentTimeMillis()
         localCompletion.setFolderStatus(folderId, newPaused, FolderStatus())
         notifyFolderStateChanged()
     }
@@ -1569,6 +1930,7 @@ class RestApi(
         if (cacheEntry.key.stateChanged.isEmpty()) {
             cacheEntry.key.stateChanged = "1"
         }
+        folderStatusWriteTime[folderStatusKey(folderId)] = System.currentTimeMillis()
         localCompletion.setFolderStatus(folderId, cacheEntry.key)
         notifyFolderStateChanged()
     }
@@ -1596,7 +1958,7 @@ class RestApi(
      * Returns prettyfied usage report.
      */
 
-    fun getUsageReport(listener: OnResultListener<String>) {
+    fun getUsageReport(listener: OnResultListener<String?>) {
         GetRequest(
             context,
             url,
@@ -1604,8 +1966,14 @@ class RestApi(
             apiKey,
             null,
             { result: String? ->
-                val json = parseString(result)
-                listener.onResult(prettyPrinter.toJson(json))
+                val json = try {
+                    parseString(result)
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                    Log.e(TAG, "getUsageReport: Failed to parse the REST API result")
+                    null
+                }
+                listener.onResult(json?.let { prettyPrinter.toJson(it) })
             },
             null
         )
@@ -1770,7 +2138,7 @@ class RestApi(
 
             if (configChanged) {
                 LogV("applyCustomRunConditions: Sending changed config ...")
-                sendConfig()
+                queueConfigSave()
             } else {
                 LogV("applyCustomRunConditions: No action was necessary.")
             }
@@ -1786,7 +2154,7 @@ class RestApi(
             }
 
             LogV("Set VersioningCleanupIntervalS to $cleanupIntervalS")
-            sendConfig()
+            queueConfigSave()
         }
     }
 
@@ -1813,6 +2181,23 @@ class RestApi(
         lastTotalSyncCompletion = totalSyncCompletion
     }
 
+    /**
+     * Parses [jsonString] as a JSON object, or returns null when it is not one.
+     *
+     * Success listeners are delivered on the main thread (see
+     * [com.micnubinub.syncthing.http.ApiRequest.connect]), so a JsonSyntaxException from a
+     * truncated or non-JSON body - a squatter on the Web GUI port is enough - would take
+     * the whole process down. Null lets the caller treat it like any other unusable
+     * answer.
+     */
+    private fun parseJsonObjectOrNull(jsonString: String?): JsonObject? = try {
+        parseString(jsonString).getAsJsonObject()
+    } catch (e: Exception) {
+        if (e is CancellationException) throw e
+        Log.e(TAG, "parseJsonObjectOrNull: Failed to parse the REST API result as a JSON object")
+        null
+    }
+
     private fun jsonToPrettyFormat(jsonString: String): String? {
         val json = parseString(jsonString).getAsJsonObject()
         return prettyPrinter.toJson(json)
@@ -1822,28 +2207,6 @@ class RestApi(
         if (ENABLE_VERBOSE_LOG) {
             Log.v(TAG, logMessage)
         }
-    }
-
-    private fun LogVMultipleLines(logMessage: String) {
-        val MAX_CHARS_PER_LOG_LINE = 4000
-        if (!ENABLE_VERBOSE_LOG) {
-            return
-        }
-        if (logMessage.length <= MAX_CHARS_PER_LOG_LINE) {
-            LogV(logMessage)
-            return
-        }
-        LogV("*** Multiple line log START ***")
-        val chunkCount = logMessage.length / MAX_CHARS_PER_LOG_LINE
-        for (i in 0..chunkCount) {
-            val max = MAX_CHARS_PER_LOG_LINE * (i + 1)
-            if (max >= logMessage.length) {
-                LogV(logMessage.substring(MAX_CHARS_PER_LOG_LINE * i))
-                continue
-            }
-            LogV(logMessage.substring(MAX_CHARS_PER_LOG_LINE * i, max))
-        }
-        LogV("*** Multiple line log END ***")
     }
 
     fun interface OnConfigChangedListener {
@@ -1866,6 +2229,19 @@ class RestApi(
          * after a config reload.
          */
         private const val MAX_CONCURRENT_COMPLETION_REQUESTS = 8
+
+        /**
+         * How long [shutdown] waits for the core to acknowledge the shutdown request
+         * before giving up and letting the caller terminate the process.
+         */
+        private const val SHUTDOWN_REQUEST_TIMEOUT_MS: Long = 5000
+
+        /**
+         * How long the startup handshake of one generation may take before it is failed,
+         * see [readConfigFromRestApi]. Bounded so a snapshot that never reports leaves the
+         * service in ERROR rather than in STARTING for the lifetime of the process.
+         */
+        private const val STARTUP_SNAPSHOT_DEADLINE_MS: Long = 60_000
 
         /**
          * Action name suffix of the intents sent to other apps that subscribed to us.

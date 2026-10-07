@@ -23,11 +23,15 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
+import java.util.concurrent.atomic.AtomicInteger
 import javax.inject.Inject
 import kotlin.concurrent.Volatile
+import kotlin.time.Duration.Companion.milliseconds
 
 // import com.google.gson.Gson;
 /**
@@ -62,15 +66,44 @@ class EventProcessor(val context: Context, val restApi: RestApi?) {
     private var consumerJob: Job? = null
 
     /**
+     * Number of events waiting in [events]. The channel does not expose its occupancy
+     * and cannot refuse a send while [BufferOverflow.DROP_OLDEST] is set, so this
+     * mirrors it in order to decide whether a droppable event has to be shed.
+     */
+    private val queuedEvents = AtomicInteger(0)
+
+    /**
      * Events pushed from the event stream and consumed on [Dispatchers.IO].
      * Bounded so a burst of events cannot grow memory without limit; if the
-     * consumer falls behind, the oldest events are dropped (they are superseded
-     * by newer state anyway).
+     * consumer falls behind, the oldest events are dropped. A drop is not
+     * harmless, so [onUndeliveredElement] records it and the consumer rebuilds
+     * the derived state from the core instead of leaving it stale.
      */
     private val events = Channel<Pair<Event, JsonElement?>>(
         capacity = EVENT_CHANNEL_CAPACITY,
-        onBufferOverflow = BufferOverflow.DROP_OLDEST
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+        onUndeliveredElement = { dropped ->
+            /**
+             * [BufferOverflow.DROP_OLDEST] silently evicts the oldest element instead of
+             * refusing the send, so the occupancy mirror has to be corrected here. Left
+             * uncorrected it only ever grows, and [enqueue] then sheds every later
+             * progress event for the lifetime of the object.
+             */
+            queuedEvents.decrementAndGet()
+            markStateIncomplete("dropped ${dropped.first.type}")
+        }
     )
+
+
+    /**
+     * Set when an event was lost (gap in the core's stream, queue overflow) or failed
+     * to process. The caches in [RestApi] are then behind the core, so they have to be
+     * rebuilt from the core rather than patched forward from the events that did
+     * arrive. Read and written from the event-stream thread as well as the consumer,
+     * hence [Volatile].
+     */
+    @Volatile
+    private var stateIncomplete = false
 
     init {
         (context.applicationContext as SyncthingApp).component().inject(this)
@@ -85,28 +118,108 @@ class EventProcessor(val context: Context, val restApi: RestApi?) {
         val activeScope = scope ?: CoroutineScope(SupervisorJob() + Dispatchers.IO).also {
             scope = it
         }
-        restApi?.startEventStream { event, json ->
-            events.trySend(event to json)
-        }
+        restApi?.startEventStream(
+            { event, json -> enqueue(event, json) },
+            { lastDeliveredId, firstMissingId ->
+                markStateIncomplete(
+                    "core dropped event ids ${lastDeliveredId + 1}..${firstMissingId - 1}"
+                )
+            }
+        )
         consumerJob?.cancel()
         consumerJob = activeScope.launch {
             consumeEvents()
         }
     }
 
+    /**
+     * Enqueues an event for processing, protecting the events that a later event
+     * cannot replace.
+     *
+     * The queue drops its oldest entry when full, so a burst of progress chatter could
+     * push out a ConfigSaved or a connect/disconnect and leave the derived state
+     * permanently wrong with nothing left to correct it. A supersedable event that
+     * arrives to a full queue is therefore dropped here, leaving the room for the
+     * events that matter.
+     */
+    private fun enqueue(event: Event, json: JsonElement?) {
+        if (isSupersedable(event) && queuedEvents.get() >= EVENT_CHANNEL_CAPACITY) {
+            markStateIncomplete("dropped supersedable ${event.type}")
+            return
+        }
+        if (events.trySend(event to json).isSuccess) {
+            queuedEvents.incrementAndGet()
+        } else {
+            markStateIncomplete("queue refused ${event.type}")
+        }
+    }
+
+    /**
+     * True if a later event makes this one irrelevant, so losing it cannot leave the
+     * derived state wrong.
+     */
+    private fun isSupersedable(event: Event): Boolean = when (event.type) {
+        // Progress samples: the next one for the same device/folder replaces them, and
+        // they are by far the most frequent events.
+        "DownloadProgress", "RemoteDownloadProgress", "FolderScanProgress" -> true
+
+        // Handled as a no-op by [onEvent], so losing them changes nothing.
+        "Ping", "Starting", "StartupComplete" -> true
+
+        else -> false
+    }
+
+    /**
+     * Records that the event stream lost or failed on an event. The consumer performs
+     * the actual reload, which also coalesces a burst of drops into one reload.
+     */
+    private fun markStateIncomplete(reason: String) {
+        if (stateIncomplete) {
+            return
+        }
+        stateIncomplete = true
+        Log.w(TAG, "Event stream incomplete: $reason")
+    }
+
+    /**
+     * Rebuilds the derived state from the core after an event was lost, so the UI
+     * cannot keep showing state the core has already moved past.
+     */
+    private fun reloadIncompleteState() {
+        if (!stateIncomplete) {
+            return
+        }
+        stateIncomplete = false
+        val api = restApi ?: return
+        Log.i(TAG, "Reloading derived state from the core after an incomplete event stream")
+        // Drops the cached folder/device state and its rate limiters, so the next
+        // query reads authoritative values from the core again.
+        api.clearCaches()
+        // A folder or device offer that arrived in the lost stretch was never shown.
+        api.showPendingFolderNotifications()
+    }
+
     private suspend fun consumeEvents() {
-        while (consumerJob?.isActive == true) {
+        // The liveness of this loop is the liveness of this coroutine. Testing the
+        // [consumerJob] field instead would race its own assignment: launch() returns
+        // before the block runs, so the coroutine can observe null (or the job of a
+        // previous start) and exit immediately, leaving no event processed at all.
+        while (currentCoroutineContext().isActive) {
             // Drain the stream; once it stays quiet for FLUSH_DEBOUNCE_MS, flush the
             // ItemFinished batch so multiple files result in one MediaScanner/MediaStore
             // call instead of one per file.
-            val next = withTimeoutOrNull(FLUSH_DEBOUNCE_MS) { events.receive() }
+            val next = withTimeoutOrNull(FLUSH_DEBOUNCE_MS.milliseconds) { events.receive() }
             if (next == null) {
                 flushItemFinishedBatch()
+                // Also here, so a stream that goes quiet after a gap is still repaired.
+                reloadIncompleteState()
                 continue
             }
             val (event, json) = next
+            queuedEvents.decrementAndGet()
             Trace.beginSection("EventProcessor.onEvent")
             try {
+                reloadIncompleteState()
                 onEvent(event, json)
                 // Flush as soon as a batch fills up so a sustained stream of
                 // ItemFinished events cannot grow the pending lists without bound.
@@ -117,7 +230,9 @@ class EventProcessor(val context: Context, val restApi: RestApi?) {
                 }
             } catch (e: Exception) {
                 // A malformed event must never kill the consumer loop, otherwise
-                // all subsequent summaries/notifications are lost.
+                // all subsequent summaries/notifications are lost. It does mean the
+                // derived state is now behind, hence the reload on the next event.
+                markStateIncomplete("failed to process ${event.type}")
                 Log.e(TAG, "onEvent: Failed to process event " + event.type, e)
             } finally {
                 Trace.endSection()
@@ -132,6 +247,15 @@ class EventProcessor(val context: Context, val restApi: RestApi?) {
         consumerJob?.cancel()
         scope?.cancel()
         scope = null
+        /**
+         * Drop whatever the consumer never got. Those events belong to the core
+         * generation that is going away, so replaying them in the next session would
+         * report state the new core never had.
+         */
+        while (events.tryReceive().isSuccess) {
+            // Drained rather than processed, so the occupancy mirror goes back to zero.
+        }
+        queuedEvents.set(0)
     }
 
     /**
@@ -356,7 +480,7 @@ class EventProcessor(val context: Context, val restApi: RestApi?) {
                 val strError = error.get("error").toString()
                 val strPath = error.get("path").toString()
 
-                if (!strError.isNullOrEmpty() && !strPath.isNullOrEmpty() &&
+                if (strError.isNotEmpty() && strPath.isNotEmpty() &&
                     strError.contains("insufficient space in basic")
                 ) {
                     val segments: List<String> =
@@ -391,9 +515,9 @@ class EventProcessor(val context: Context, val restApi: RestApi?) {
             Log.e(TAG, "onFolderSummary: summary == null")
             return
         }
-        var folderStatus: FolderStatus = FolderStatus()
-        try {
-            folderStatus = gson.fromJson(summary, FolderStatus::class.java)
+
+        val folderStatus: FolderStatus = try {
+            gson.fromJson(summary, FolderStatus::class.java)
         } catch (e: Exception) {
             Log.e(TAG, "onFolderSummary: gson.fromJson failed", e)
             return
@@ -417,7 +541,7 @@ class EventProcessor(val context: Context, val restApi: RestApi?) {
     ) {
         if (!error.isNullOrEmpty()) {
             Log.e(TAG, "onItemFinished: Error \"$error\" reported on file: $fullFilePath")
-            if (error.contains("no space left on device") == true) {
+            if (error.contains("no space left on device")) {
                 val segments: List<String> =
                     fullFilePath.split(File.separator.toRegex()).dropLastWhile { it.isEmpty() }
                 val shortenedFileAndFolder =
@@ -545,7 +669,7 @@ class EventProcessor(val context: Context, val restApi: RestApi?) {
         }
         for (i in 0..<filenames.size()) {
             var filename = (filenames.get(i) as JsonElement).toString()
-            if (!filename.isNullOrEmpty()) {
+            if (filename.isNotEmpty()) {
                 filename = filename.replace("^\"|\"$".toRegex(), "")
                 LogV("onLocalIndexUpdated: filename=[$filename], time=[$dateTimeStamp]")
                 if (i == filenames.size() - 1) {
@@ -582,7 +706,7 @@ class EventProcessor(val context: Context, val restApi: RestApi?) {
         }
         // LogV("onRemoteIndexUpdated: deviceId=[" + deviceId + "], folder=[" + folderId + "], items=" + items);
         if (items > 0) {
-            restApi?.setRemoteIndexUpdated(deviceId, folderId, true)
+            restApi?.setRemoteIndexUpdated(folderId, true)
         }
     }
 

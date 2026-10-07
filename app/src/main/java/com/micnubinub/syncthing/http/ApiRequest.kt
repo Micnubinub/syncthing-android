@@ -1,6 +1,5 @@
 package com.micnubinub.syncthing.http
 
-
 import android.content.Context
 import android.net.Uri
 import android.util.Log
@@ -10,7 +9,11 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.Request
@@ -27,6 +30,14 @@ abstract class ApiRequest internal constructor(
     private val path: String?,
     private val apiKey: String?
 ) {
+    /**
+     * The outcome of a request that was awaited to completion, see [connectAwait].
+     */
+    sealed interface ApiResult {
+        data class Success(val body: String) : ApiResult
+        data class Failure(val error: ApiError) : ApiResult
+    }
+
     protected val TAG: String
         get() = this::class.simpleName ?: "Syncthing"
     private val mainScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
@@ -47,73 +58,175 @@ abstract class ApiRequest internal constructor(
         val uriBuilder = mUrl.toString().toUri()
             .buildUpon()
             .path(path)
-        for (entry in params.entries) {
-            uriBuilder.appendQueryParameter(entry.key, entry.value)
+        for ((key, value) in params) {
+            uriBuilder.appendQueryParameter(key, value)
         }
         return uriBuilder.build()
     }
 
     /**
      * Enqueues the request, then returns success status and response string.
+     *
+     * Exactly one of [listener] or [errorListener] is invoked, including when the
+     * response starts arriving and then breaks part way through: a caller that waits on
+     * one of them (see [PollWebGuiAvailableTask.suspendPerformRequest]) would otherwise
+     * wait for a result that is never produced.
      */
     fun connect(
         requestMethod: String, uri: Uri?, requestBody: String?,
         listener: OnSuccessListener?, errorListener: OnErrorListener?
     ) {
-        val uriString = uri?.toString()
-        if (uriString.isNullOrEmpty()) {
+        val call = newCall(requestMethod, uri, requestBody) ?: run {
             errorListener?.onError(ApiError.Network(IOException("Failed to build request URI")))
             return
+        }
+
+        activeCall = call
+        call.enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                deliverError(
+                    call, uri, errorListener, e,
+                    if (call.isCanceled()) ApiError.Cancelled(e) else ApiError.Network(e)
+                )
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                try {
+                    response.use { resp ->
+                        if (!resp.isSuccessful) {
+                            val error = ApiError.Http(
+                                resp.code, resp.body.string(), resp.message
+                            )
+                            deliverError(call, uri, errorListener, null, error)
+                            return
+                        }
+                        val body = responseBodyToString(resp)
+                        mainScope.launch {
+                            listener?.onSuccess(body)
+                        }
+                    }
+                } catch (e: IOException) {
+                    // The status line arrived but the body did not finish, so this is a
+                    // transport failure rather than an HTTP error. Reporting it is the
+                    // only way the caller learns the request failed at all.
+                    deliverError(call, uri, errorListener, e, ApiError.Network(e))
+                } finally {
+                    // Only now that the body has been consumed is this request no longer
+                    // cancellable, so ownership is held for the whole of onResponse.
+                    if (activeCall === call) {
+                        activeCall = null
+                    }
+                    SyncthingHttpClients.untrack(call)
+                }
+            }
+        })
+    }
+
+    /**
+     * Delivers the single terminal failure result of a request, releasing its ownership
+     * and keeping the log for callers that supplied no error listener.
+     */
+    private fun deliverError(
+        call: Call,
+        uri: Uri?,
+        errorListener: OnErrorListener?,
+        cause: IOException?,
+        error: ApiError
+    ) {
+        if (activeCall === call) {
+            activeCall = null
+        }
+        // A failed call is over, so it must leave the in-flight set here. The callback
+        // style has no other place to do it: onFailure never reaches the try/finally of
+        // onResponse, and a call that is never released keeps cancelInFlightCalls()
+        // handing out cancellations for a request that finished long ago.
+        SyncthingHttpClients.untrack(call)
+        if (errorListener == null) {
+            Log.w(TAG, "Request to $uri failed: $error", cause)
+        } else {
+            mainScope.launch { errorListener.onError(error) }
+        }
+    }
+
+    /**
+     * Performs the request and suspends until its outcome is known.
+     *
+     * Use this instead of [connect] whenever the caller acknowledges the change to the
+     * user: the callback style reports nothing, so a caller that treats "request sent" as
+     * "write persisted" reports success for a write that never landed.
+     *
+     * Exactly one [ApiResult] is returned, including when reading the response body
+     * fails, so an awaiting caller can never be stranded. Cancelling the calling
+     * coroutine discards the result and cancels the request itself.
+     */
+    suspend fun connectAwait(
+        requestMethod: String, uri: Uri?, requestBody: String?
+    ): ApiResult {
+        val call = newCall(requestMethod, uri, requestBody)
+            ?: return ApiResult.Failure(ApiError.Network(IOException("Failed to build request URI")))
+
+        return withContext(Dispatchers.IO) {
+            activeCall = call
+            /**
+             * [Call.execute] blocks and only [Call.cancel] can interrupt it, while
+             * cancelling the awaiting coroutine unwinds nothing until execute() returns.
+             * A caller that bounds this with a timeout - the shutdown POST, which runs
+             * while the core lifecycle lock is held - would therefore wait for the client's
+             * own much longer read timeout instead of its own deadline. Tying the call to
+             * this scope makes the timeout effective.
+             */
+            val cancelOnScopeEnd = currentCoroutineContext().job.invokeOnCompletion {
+                call.cancel()
+            }
+            try {
+                val result = try {
+                    call.execute().use { response ->
+                        if (!response.isSuccessful) {
+                            ApiResult.Failure(
+                                ApiError.Http(
+                                    response.code,
+                                    response.body.string(),
+                                    response.message
+                                )
+                            )
+                        } else {
+                            ApiResult.Success(responseBodyToString(response))
+                        }
+                    }
+                } catch (e: IOException) {
+                    if (call.isCanceled()) {
+                        ApiResult.Failure(ApiError.Cancelled(e))
+                    } else {
+                        Log.w(TAG, "Request to $uri failed, msg=${e.message}", e)
+                        ApiResult.Failure(ApiError.Network(e))
+                    }
+                }
+                // A save that was abandoned mid-flight must not be reported as applied.
+                ensureActive()
+                result
+            } finally {
+                cancelOnScopeEnd.dispose()
+                if (activeCall === call) {
+                    activeCall = null
+                }
+                SyncthingHttpClients.untrack(call)
+            }
+        }
+    }
+
+    private fun newCall(requestMethod: String, uri: Uri?, requestBody: String?): Call? {
+        val uriString = uri?.toString()
+        if (uriString.isNullOrEmpty()) {
+            return null
         }
         val requestBuilder = Request.Builder().url(uriString)
         apiKey?.let { requestBuilder.header(HEADER_API_KEY, it) }
         val body = requestBody?.toRequestBody(null)
             ?: ByteArray(0).toRequestBody(null)
         requestBuilder.method(requestMethod, if (requestMethod == "GET") null else body)
-
-        val client = SyncthingHttpClients.get(context)
-
-        activeCall = client.newCall(requestBuilder.build())
-        activeCall?.enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) {
-                if (activeCall === call) {
-                    activeCall = null
-                }
-                val error =
-                    if (call.isCanceled()) ApiError.Cancelled(e) else ApiError.Network(e)
-                mainScope.launch {
-                    if (errorListener != null) {
-                        errorListener.onError(error)
-                    } else {
-                        Log.w(TAG, "Request to $uri failed, msg=${e.message}", e)
-                    }
-                }
-            }
-
-            override fun onResponse(call: Call, response: Response) {
-                if (activeCall === call) {
-                    activeCall = null
-                }
-                response.use { resp ->
-                    if (!resp.isSuccessful) {
-                        val error = ApiError.Http(
-                            resp.code, resp.body.string(), resp.message
-                        )
-                        mainScope.launch {
-                            errorListener?.onError(error) ?: Log.w(
-                                TAG,
-                                "Request to $uri failed, code=${resp.code}, msg=${resp.message}"
-                            )
-                        }
-                        return
-                    }
-                    val body = responseBodyToString(resp)
-                    mainScope.launch {
-                        listener?.onSuccess(body)
-                    }
-                }
-            }
-        })
+        return SyncthingHttpClients.track(
+            SyncthingHttpClients.get(context).newCall(requestBuilder.build())
+        )
     }
 
     /**

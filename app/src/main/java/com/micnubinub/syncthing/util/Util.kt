@@ -12,6 +12,8 @@ import com.micnubinub.syncthing.R
 import com.micnubinub.syncthing.model.Device
 import com.micnubinub.syncthing.model.Folder
 import com.micnubinub.syncthing.service.Constants
+import com.micnubinub.syncthing.util.Util.PROCESS_DESTROYED_EXIT_CODE
+import com.micnubinub.syncthing.util.Util.waitForOrDestroy
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -21,29 +23,47 @@ import java.io.IOException
 import java.io.InputStreamReader
 import java.nio.charset.Charset
 import java.security.KeyStore
+import java.text.DateFormat
 import java.text.DecimalFormat
 import java.time.LocalDateTime
 import java.time.ZoneId
 import java.time.ZoneOffset
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
-import java.time.format.FormatStyle
 import java.util.Locale
 import javax.net.ssl.TrustManagerFactory
 import javax.net.ssl.X509TrustManager
 import kotlin.concurrent.Volatile
 import kotlin.math.log10
 import kotlin.math.pow
+import kotlin.time.Duration.Companion.milliseconds
 
 object Util {
     private const val TAG = "Util"
     private val formatter = DecimalFormat("#,##0.#")
     private val timeFormatter by lazy {
-        DateTimeFormatter.ofLocalizedTime(FormatStyle.MEDIUM).withLocale(Locale.getDefault())
+        DateFormat.getTimeInstance(DateFormat.MEDIUM, Locale.getDefault())
     }
     private val dateTimeFormatter by lazy {
-        DateTimeFormatter.ofLocalizedDateTime(FormatStyle.MEDIUM).withLocale(Locale.getDefault())
+        DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.MEDIUM, Locale.getDefault())
     }
+
+    /**
+     * How long a helper command may keep running after it closed its output before it is
+     * destroyed. Without a bound, one stuck command holds the caller for good.
+     */
+    private const val PROCESS_EXIT_TIMEOUT_MS: Long = 30 * 1000L
+
+    /**
+     * Gap between two exit checks, see [waitForOrDestroy].
+     */
+    private const val PROCESS_EXIT_POLL_INTERVAL_MS: Long = 50
+
+    /**
+     * Stand-in exit code for a command that had to be destroyed, so a caller cannot mistake
+     * it for the success code.
+     */
+    private const val PROCESS_DESTROYED_EXIT_CODE = -1
 
     /**
      * Converts a number of bytes to a human readable file size (eg 3.5 GiB).
@@ -94,39 +114,51 @@ object Util {
     }
 
     /**
-     * Look for running processes and return an array
+     * Look for running processes owned by this app and return an array
      * containing the PIDs of found instances.
+     *
+     * The UID of this app is requested explicitly and every candidate is matched
+     * against it, so a process of another app is never returned and thus never
+     * signalled. If the platform `ps` does not report the requested columns no
+     * PID is returned, as killing an unverified process is worse than leaving
+     * an orphan behind.
      */
     suspend fun getProcessPIDs(processName: String): MutableList<String> {
         val processPIDs: MutableList<String> = ArrayList()
-        val output = getCommandOutput(listOf("ps"))
+        val ownUid = android.os.Process.myUid().toString()
+        val output = getCommandOutput(listOf("ps", "-A", "-o", "PID,UID,ARGS"))
         if (output.isEmpty()) {
             Log.w(TAG, "getProcessPIDs: Failed to list processes. ps command returned empty.")
             return processPIDs
         }
 
         val lines = output.split("\n".toRegex()).dropLastWhile { it.isEmpty() }
-        if (lines.size == 0) {
+        if (lines.size <= 1) {
             Log.w(TAG, "getProcessPIDs: Failed to list processes. ps command returned no rows.")
             return processPIDs
         }
 
-        for (i in lines.indices) {
-            val line = lines[i]
-            val columns =
-                line.trim { it <= ' ' }.split("\\s+".toRegex()).dropLastWhile { it.isEmpty() }
-            if (columns.size < 2) {
+        // Skip the header row, the columns are PID, UID and the full argument list.
+        for (i in 1 until lines.size) {
+            val line = lines[i].trim { it <= ' ' }
+            if (line.isEmpty()) {
+                continue
+            }
+            val columns = line.split("\\s+".toRegex())
+            if (columns.size < 3) {
+                continue
+            }
+            val processPID: String = columns[0]
+            if (columns[1] != ownUid) {
+                // Owned by another app, never signal it.
                 continue
             }
             // Match the exact process name (a whole `ps` token, stripped of any
             // path) so unrelated processes that merely contain the name as a
             // substring of their command line are never matched and killed.
-            // Any token is considered because `ps` may print the process name as
-            // a bare name, a full path, or followed by its arguments.
-            val matches = columns.any { it.substringAfterLast('/') == processName }
+            val arguments = columns.drop(2).joinToString(" ")
+            val matches = arguments.split(" ").any { it.substringAfterLast('/') == processName }
             if (matches) {
-                val processPID: String = columns[1]
-                // Log.v(TAG, "getProcessPIDs: Found PID [" + processPID + "] for ["+ processName + "]");
                 processPIDs.add(processPID)
             }
         }
@@ -166,7 +198,7 @@ object Util {
                 }
                 break
             }
-            delay(50)
+            delay(50.milliseconds)
         }
         Log.d(TAG, "killProcess: No more instances of [$processName] running")
     }
@@ -190,7 +222,7 @@ object Util {
                     Log.v(TAG, "runCommand: $line")
                 }
             }
-            exitCode = process.waitFor()
+            exitCode = waitForOrDestroy(process, "runCommand")
         } catch (e: Exception) {
             Log.w(TAG, "runCommand: Exception", e)
         } finally {
@@ -208,25 +240,59 @@ object Util {
     suspend fun getCommandOutput(command: List<String>): String = withContext(Dispatchers.IO) {
         Log.d(TAG, "getCommandOutput: ${command.joinToString(" ")}")
 
+        var process: Process? = null
+        var output = ""
         try {
-            val process = ProcessBuilder(command).apply { redirectErrorStream(true) }.start()
-            val output = process.inputStream.bufferedReader(Charsets.UTF_8).use { reader ->
+            val started = ProcessBuilder(command).apply { redirectErrorStream(true) }.start()
+            process = started
+            output = started.inputStream.bufferedReader(Charsets.UTF_8).use { reader ->
                 reader.readText()
             }
-            val exitCode = process.waitFor()
+            val exitCode = waitForOrDestroy(started, "getCommandOutput")
 
             if (exitCode != 0) {
                 Log.i(TAG, "getCommandOutput: Exited with code $exitCode")
             }
-
-            output
         } catch (e: IOException) {
             Log.w(TAG, "getCommandOutput: IOException", e)
-            ""
-        } catch (e: InterruptedException) {
-            Thread.currentThread().interrupt()
-            Log.w(TAG, "getCommandOutput: Interrupted", e)
-            ""
+            return@withContext ""
+        } finally {
+            // A command that closed its stdout but never exits would otherwise stay alive.
+            process?.destroy()
+        }
+        output
+    }
+
+    /**
+     * Waits for [process] to exit, destroying it if it outlasts the deadline.
+     *
+     * Polls rather than using [Process.waitFor] with a timeout, which API 24-25 lack.
+     *
+     * @return the exit code, or [PROCESS_DESTROYED_EXIT_CODE] when the process had to be
+     * destroyed.
+     */
+    private fun waitForOrDestroy(process: Process, caller: String): Int {
+        val deadline = SystemClock.elapsedRealtime() + PROCESS_EXIT_TIMEOUT_MS
+        while (true) {
+            try {
+                return process.exitValue()
+            } catch (e: IllegalThreadStateException) {
+                if (SystemClock.elapsedRealtime() >= deadline) {
+                    Log.w(
+                        TAG,
+                        caller + ": Did not exit within " +
+                                PROCESS_EXIT_TIMEOUT_MS + " ms, destroying it"
+                    )
+                    process.destroy()
+                    return PROCESS_DESTROYED_EXIT_CODE
+                }
+                try {
+                    Thread.sleep(PROCESS_EXIT_POLL_INTERVAL_MS)
+                } catch (interrupted: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    return PROCESS_DESTROYED_EXIT_CODE
+                }
+            }
         }
     }
 
@@ -252,7 +318,7 @@ object Util {
                     capturedStdOut.appendLine(line)
                 }
             }
-            process.waitFor()
+            waitForOrDestroy(process, "runProcessBuilderGetOutput")
         } catch (e: Exception) {
             Log.w(TAG, "runProcessBuilderGetOutput: Exception", e)
         } finally {
@@ -520,8 +586,8 @@ object Util {
      * Compares folders by name, uses the folder ID as fallback if the name is empty
      */
     val FOLDERS_COMPARATOR = Comparator { lhs: Folder, rhs: Folder ->
-        val lhsLabel = if (!lhs.label.isEmpty()) lhs.label else lhs.id
-        val rhsLabel = if (!rhs.label.isEmpty()) rhs.label else rhs.id
+        val lhsLabel = lhs.label.ifEmpty { lhs.id }
+        val rhsLabel = rhs.label.ifEmpty { rhs.id }
         lhsLabel.orEmpty().compareTo(rhsLabel.orEmpty())
     }
 
@@ -529,8 +595,8 @@ object Util {
      * Compares devices by name, uses the device ID as fallback if the name is empty
      */
     val DEVICES_COMPARATOR = Comparator<Device> { lhs, rhs ->
-        val lhsName = if (!lhs.name.isNullOrEmpty()) lhs.name else lhs.deviceID
-        val rhsName = if (!rhs.name.isNullOrEmpty()) rhs.name else rhs.deviceID
+        val lhsName = lhs.name.ifEmpty { lhs.deviceID }
+        val rhsName = rhs.name.ifEmpty { rhs.deviceID }
         lhsName.orEmpty().compareTo(rhsName.orEmpty())
     }
 

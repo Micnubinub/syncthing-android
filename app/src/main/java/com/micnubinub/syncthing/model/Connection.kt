@@ -19,9 +19,11 @@ data class Connection(
 ) {
     fun setTransferRate(previous: Connection, msElapsed: Long) {
         val secondsElapsed = msElapsed / 1000
-        val inBytes = 8 * (inBytesTotal - previous.inBytesTotal) / secondsElapsed
-        val outBytes = 8 * (outBytesTotal - previous.outBytesTotal) / secondsElapsed
-        inBits = max(0, inBytes)
-        outBits = max(0, outBytes)
+        if (secondsElapsed != 0L) {
+            val inBytes = 8 * (inBytesTotal - previous.inBytesTotal) / secondsElapsed
+            val outBytes = 8 * (outBytesTotal - previous.outBytesTotal) / secondsElapsed
+            inBits = max(0, inBytes)
+            outBits = max(0, outBytes)
+        }
     }
 }

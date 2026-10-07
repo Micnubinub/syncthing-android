@@ -78,6 +78,13 @@ private sealed interface ShareRoute : NavKey {
 class ShareActivity : SyncthingActivity(), OnServiceStateChangeListener {
     private val viewModel by viewModels<ShareActivityViewModel>()
 
+    /**
+     * True once [onStart] has explicitly started the service, i.e. once it is a started
+     * service with a [com.micnubinub.syncthing.service.RunConditionMonitor] listening on
+     * [RunConditionBus].
+     */
+    private var syncthingServiceStarted = false
+
     @Inject
     lateinit var preferences: SharedPreferences
 
@@ -200,6 +207,19 @@ class ShareActivity : SyncthingActivity(), OnServiceStateChangeListener {
         syncthingService.registerOnServiceStateChangeListener(this)
     }
 
+    override fun onStart() {
+        super.onStart()
+        // The service is only ever bound (see [SyncthingActivity.onResume]). A service
+        // created by BIND_AUTO_CREATE never receives onStartCommand, so no
+        // RunConditionMonitor is instantiated and the immediate-sync trigger in
+        // [afterCopyFilesTask] would have no listener at all. Start it explicitly while
+        // this activity is visible, so the trigger is observed.
+        startService(Intent(this, SyncthingService::class.java))
+        // Only now is the service known to be a started service that will evaluate run
+        // conditions, so only now may the sync trigger be considered deliverable.
+        syncthingServiceStarted = true
+    }
+
     override fun onServiceStateChange(currentState: SyncthingService.State) {
         viewModel.onServiceStateChange(currentState)
     }
@@ -247,10 +267,18 @@ class ShareActivity : SyncthingActivity(), OnServiceStateChangeListener {
 
     private fun afterCopyFilesTask() {
         if (preferences.getBoolean(Constants.PREF_RUN_ON_TIME_SCHEDULE, false)) {
-            Log.v(TAG, "prefRunOnTimeSchedule=true, notifying RunConditionMonitor")
-            RunConditionBus.tryEmit(
-                RunConditionEvent.SyncTriggerFired(true)
-            )
+            if (syncthingServiceStarted) {
+                Log.v(TAG, "prefRunOnTimeSchedule=true, notifying RunConditionMonitor")
+                RunConditionBus.tryEmit(
+                    RunConditionEvent.SyncTriggerFired(true)
+                )
+            } else {
+                Log.w(
+                    TAG,
+                    "prefRunOnTimeSchedule=true, but SyncthingService was never started, " +
+                            "skipping immediate sync trigger"
+                )
+            }
         }
 
         finish()
@@ -303,8 +331,7 @@ class ShareActivity : SyncthingActivity(), OnServiceStateChangeListener {
 
         val files: MutableMap<Uri, String?> = LinkedHashMap()
         for (sourceUri in extrasToCopy) {
-            var displayName = getDisplayNameForUri(sourceUri) ?: generateDisplayName()
-            files[sourceUri] = displayName
+            files[sourceUri] = getDisplayNameForUri(sourceUri) ?: generateDisplayName()
         }
         return files
     }
@@ -325,10 +352,10 @@ class ShareActivity : SyncthingActivity(), OnServiceStateChangeListener {
      * Get file name from uri.
      */
     private fun getDisplayNameForUri(uri: Uri): String? {
-        var displayName = if (ContentResolver.SCHEME_CONTENT != uri.scheme) {
+        val displayName = if (ContentResolver.SCHEME_CONTENT != uri.scheme) {
             uri.lastPathSegment
         } else {
-            val tmpDisplayName = getDisplayNameFromContentResolver(uri)
+            var tmpDisplayName = getDisplayNameFromContentResolver(uri)
                 ?: uri.lastPathSegment?.replace("\\s".toRegex(), "")
 
             // Add best possible extension
@@ -338,14 +365,11 @@ class ShareActivity : SyncthingActivity(), OnServiceStateChangeListener {
             ) {
                 val mimeType = this.contentResolver.getType(uri)
                 val extension = MimeTypeMap.getSingleton().getExtensionFromMimeType(mimeType)
-                if (extension != null) {
-                    tmpDisplayName + ".$extension"
-                } else {
-                    tmpDisplayName
+                if (extension != null && tmpDisplayName != null) {
+                    tmpDisplayName = "$tmpDisplayName.$extension"
                 }
-            } else {
-                tmpDisplayName
             }
+            tmpDisplayName
         }
 
         // Replace path separator characters to avoid inconsistent paths, then strip
@@ -363,8 +387,7 @@ class ShareActivity : SyncthingActivity(), OnServiceStateChangeListener {
      */
     private fun getDisplayNameFromContentResolver(uri: Uri): String? {
         var displayName: String? = null
-        val mimeType = contentResolver.getType(uri)
-        if (mimeType != null) {
+        contentResolver.getType(uri)?.let { mimeType ->
             val displayNameColumn = if (mimeType.startsWith("image/")) {
                 MediaStore.Images.ImageColumns.DISPLAY_NAME
             } else if (mimeType.startsWith("video/")) {
@@ -389,7 +412,7 @@ class ShareActivity : SyncthingActivity(), OnServiceStateChangeListener {
                     }
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "Could not retrieve display name for " + uri.toString())
+                Log.e(TAG, "Could not retrieve display name for $uri")
                 // nothing else, displayName keeps null
             }
         }

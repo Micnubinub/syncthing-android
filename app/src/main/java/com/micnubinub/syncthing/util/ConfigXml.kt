@@ -77,8 +77,25 @@ class ConfigXml(private val context: Context) {
         configFile = Constants.getConfigFile(context)
     }
 
+    /**
+     * Parses config.xml into the in-memory DOM. This is a pure read: it never writes the
+     * file, so it is safe to call on any path, including while the core owns the file.
+     * Use [loadConfigAndUpdate] for the pre-start call sites that also apply migrations.
+     */
     @Throws(OpenConfigException::class)
     fun loadConfig() {
+        cachedLocalDeviceID = null
+        parseConfig()
+    }
+
+    /**
+     * [loadConfig] plus the one-time migration/repair pass ([updateIfNeeded]), which may
+     * write the file back. Only call this before the core is started: the core owns
+     * config.xml once it runs, and a write from here would either be overwritten by the
+     * core or be read by it as a partially written file.
+     */
+    @Throws(OpenConfigException::class)
+    fun loadConfigAndUpdate() {
         cachedLocalDeviceID = null
         parseConfig()
         updateIfNeeded()
@@ -107,7 +124,7 @@ class ConfigXml(private val context: Context) {
 
         // Set local device name.
         Log.i(TAG, "Starting syncthing to retrieve local device id.")
-        if (!localDeviceIDandStoreToPref.isNullOrEmpty()) {
+        if (localDeviceIDandStoreToPref.isNotEmpty()) {
             changed = changeLocalDeviceName(localDeviceIDandStoreToPref) || changed
         }
 
@@ -181,7 +198,7 @@ class ConfigXml(private val context: Context) {
                         Constants.PREF_LOCAL_DEVICE_ID,
                         ""
                     ) ?: ""
-            if (localDeviceID.isNullOrEmpty()) {
+            if (localDeviceID.isEmpty()) {
                 Log.d(
                     TAG,
                     "getLocalDeviceIDfromPref: Local device ID unavailable, trying to retrieve it from syncthing ..."
@@ -194,7 +211,7 @@ class ConfigXml(private val context: Context) {
                         "getLocalDeviceIDfromPref: Failed to execute syncthing core"
                     )
                 }
-                if (localDeviceID.isNullOrEmpty()) {
+                if (localDeviceID.isEmpty()) {
                     Log.e(
                         TAG,
                         "getLocalDeviceIDfromPref: Local device ID unavailable"
@@ -316,7 +333,7 @@ class ConfigXml(private val context: Context) {
      */
     private fun updateIfNeeded() {
         /* Perform one-time migration tasks on syncthing's config file when coming from an older config version. */
-        var changed = migrateSyncthingOptions() || false
+        var changed = migrateSyncthingOptions()
 
         /* Get refs to important config objects */
         val folders = config?.documentElement?.getElementsByTagName("folder")
@@ -338,10 +355,7 @@ class ConfigXml(private val context: Context) {
         }
 
         /* Section - GUI */
-        val gui = guiElement
-        if (gui == null) {
-            throw OpenConfigException()
-        }
+        val gui = guiElement ?: throw OpenConfigException()
 
         // Platform-specific: Force REST API and Web UI access to use TLS.
         // Cleartext HTTP is never acceptable as it would expose the API key and
@@ -540,7 +554,7 @@ class ConfigXml(private val context: Context) {
     val folders: MutableList<Folder>
         get() {
             val localDeviceID = this.localDeviceIDfromPref
-            val folders: MutableList<Folder> = ArrayList<Folder>()
+            val folders: MutableList<Folder> = ArrayList()
 
             // Prevent enumerating "<folder>" tags below "<default>" nodes by enumerating child nodes manually.
             val childNodes = config?.documentElement?.childNodes
@@ -736,7 +750,7 @@ class ConfigXml(private val context: Context) {
                 // LogV("folder.label=" + folder.label + "/" +"folder.type=" + folder.type + "/" + "folder.paused=" + folder.paused);
                 folders.add(folder)
             }
-            Collections.sort<Folder>(
+            Collections.sort(
                 folders,
                 FOLDERS_COMPARATOR
             )
@@ -960,7 +974,10 @@ class ConfigXml(private val context: Context) {
     /**
      * Stores ignore list for given folder.
      */
-    fun postFolderIgnoreList(folder: Folder, ignore: List<String>) {
+    /**
+     * @return whether the file was written; see [ConfigRouter.postFolderIgnoreList].
+     */
+    fun postFolderIgnoreList(folder: Folder, ignore: List<String>): Boolean {
         try {
             val file = File(folder.path, Constants.FILENAME_STIGNORE)
             // Write to a temp file, fsync, then atomically rename into place so a
@@ -979,7 +996,7 @@ class ConfigXml(private val context: Context) {
             } finally {
                 tempFile.delete()
             }
-
+            return true
         } catch (e: IOException) {
             /**
              * This will happen on external storage folders which exist outside the
@@ -990,6 +1007,7 @@ class ConfigXml(private val context: Context) {
                 "postFolderIgnoreList: Failed to write '" + folder.path + "/" + Constants.FILENAME_STIGNORE + "' #1",
                 e
             )
+            return false
         }
     }
 
@@ -1127,7 +1145,7 @@ class ConfigXml(private val context: Context) {
             val nodeConfig = config?.documentElement
             val nodeDevice = config?.createElement("device")
             nodeConfig?.appendChild(nodeDevice)
-            nodeDevice?.let { it.setAttribute("id", device.deviceID) }
+            nodeDevice?.setAttribute("id", device.deviceID)
         }
 
         // Prevent enumerating "<device>" tags below "<folder>" nodes by enumerating child nodes manually.
@@ -1309,7 +1327,7 @@ class ConfigXml(private val context: Context) {
             for (i in 0..<listenAddressNodes.length) {
                 val addressNode = listenAddressNodes.item(i)
                 val addressText = addressNode.textContent.trim { it <= ' ' }
-                if (!addressText.isEmpty()) {
+                if (addressText.isNotEmpty()) {
                     listenAddressesList.add(addressText)
                 }
             }
@@ -1553,7 +1571,7 @@ class ConfigXml(private val context: Context) {
             newElement?.textContent = text
             parent.appendChild(newElement)
         }
-        return (!toRemove.isEmpty() || textArray.isNotEmpty())
+        return (toRemove.isNotEmpty() || textArray.isNotEmpty())
     }
 
     private val guiElement: Element?
@@ -1640,19 +1658,35 @@ class ConfigXml(private val context: Context) {
     }
 
     /**
-     * Writes updated mConfig back to file.
+     * Writes the parsed config back to disk through a temporary file that is renamed over
+     * the original, so a failed write can never truncate a working config.
+     *
+     * @return true only when the new content is durable and in place. A caller that
+     * acknowledges the change to the user must check this instead of assuming the write
+     * landed.
      */
-    fun saveChanges() {
+    fun saveChanges(): Boolean {
         if (!configFile.canWrite()) {
             Log.w(
                 TAG,
                 "Failed to save updated config. Cannot change the owner of the config file."
             )
-            return
+            return false
         }
 
         Log.i(TAG, "Saving config file")
-        val mConfigTempFile = Constants.getConfigTempFile(context)
+        /**
+         * A private temporary name per write: [ConfigXml] instances that are not shared
+         * through [ConfigRouter] (the service's own config, key generation) would
+         * otherwise write through the same "config.xml.tmp" and rename a half-written
+         * document over each other.
+         */
+        val mConfigTempFile = try {
+            File.createTempFile("config", ".tmp", configFile.parentFile)
+        } catch (e: IOException) {
+            Log.w(TAG, "Failed to create a temporary config file", e)
+            return false
+        }
         try {
             // Write XML header.
             FileOutputStream(mConfigTempFile).use { fileOutputStream ->
@@ -1710,16 +1744,20 @@ class ConfigXml(private val context: Context) {
                 }
             }
             mConfigTempFile.delete()
-            return
+            return false
         }
-        try {
+        return try {
             if (!mConfigTempFile.renameTo(configFile)) {
                 Log.w(TAG, "Failed to rename temporary config file to original file")
                 mConfigTempFile.delete()
+                false
+            } else {
+                true
             }
         } catch (e: Exception) {
             Log.w(TAG, "Failed to rename temporary config file to original file", e)
             mConfigTempFile.delete()
+            false
         }
     }
 

@@ -24,6 +24,7 @@ import okhttp3.Request
 import java.io.IOException
 import java.net.URL
 import java.util.concurrent.TimeUnit
+import kotlin.time.Duration.Companion.milliseconds
 
 /**
  * Long-polls syncthing's `/rest/events` endpoint and delivers events as they occur.
@@ -43,7 +44,15 @@ class EventsPoller internal constructor(
     private val context: Context,
     url: URL,
     apiKey: String?,
-    private val onEvent: (event: Event, json: JsonElement?) -> Unit
+    private val onEvent: (event: Event, json: JsonElement?) -> Unit,
+    /**
+     * Invoked when the delivered ids reveal that events in
+     * `(lastDeliveredId, firstMissingId)` were never seen, i.e. the core's own event
+     * buffer overflowed and dropped them. A consumer cannot patch its state forward
+     * across such a gap and has to re-read the authoritative state instead.
+     */
+    private val onStreamGap: (lastDeliveredId: Long, firstMissingId: Long) -> Unit =
+        { _, _ -> }
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val gson = GsonBuilder().create()
@@ -113,7 +122,7 @@ class EventsPoller internal constructor(
                     TAG, "Event stream disconnected, retrying in $reconnectDelayMs ms",
                     e
                 )
-                delay(reconnectDelayMs)
+                delay(reconnectDelayMs.milliseconds)
                 reconnectDelayMs = minOf(reconnectDelayMs * 2, RECONNECT_DELAY_MAX_MS)
             }
         }
@@ -126,6 +135,12 @@ class EventsPoller internal constructor(
             .build()
         val call = client.newCall(request)
         activeCall = call
+        if (stopped) {
+            // stop() can run between newCall() and the assignment above, when there was
+            // nothing to cancel yet, and [Call.execute] is not interruptible. Cancelling
+            // here keeps stop() from waiting out a whole long-poll.
+            call.cancel()
+        }
         try {
             call.execute().use { response ->
                 if (!response.isSuccessful) {
@@ -157,6 +172,7 @@ class EventsPoller internal constructor(
             Log.w(TAG, "Events payload is not an array, raw=[$body]")
             return
         }
+        var gapChecked = false
         for (element in json.asJsonArray) {
             if (stopped) return
             val event = try {
@@ -166,10 +182,35 @@ class EventsPoller internal constructor(
                 continue
             }
             val id = event.id.toLong()
+            if (!gapChecked) {
+                gapChecked = true
+                if (id > lastEventId + 1) {
+                    // Ids are contiguous per core run, so a jump means the core's event
+                    // buffer overflowed and dropped everything in between.
+                    Log.w(
+                        TAG,
+                        "Event gap: ids ${lastEventId + 1}..${id - 1} were dropped by the core"
+                    )
+                    onStreamGap(lastEventId, id)
+                }
+            }
             if (id > lastEventId) {
                 lastEventId = id
             }
-            onEvent(event, element)
+            try {
+                onEvent(event, element)
+            } catch (ex: CancellationException) {
+                throw ex
+            } catch (ex: Exception) {
+                /**
+                 * The id has already moved past this event, so a consumer that throws would
+                 * abandon the rest of the batch and the next poll would resume after it:
+                 * those events would be lost with no gap to notice. Report this one event
+                 * as missed instead, so the consumer can rebuild from the core.
+                 */
+                Log.w(TAG, "Event ${event.type} (id=$id) failed, skipping it", ex)
+                onStreamGap(id, id + 1)
+            }
         }
     }
 

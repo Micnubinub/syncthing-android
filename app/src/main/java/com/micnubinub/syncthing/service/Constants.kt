@@ -192,12 +192,30 @@ object Constants {
     /**
      * File in the config folder we write to temporarily before renaming to CONFIG_FILE.
      */
-    private const val CONFIG_TEMP_FILE = "config.xml.tmp"
 
     /**
      * Name of the folder containing the index database.
      */
     private const val INDEX_DB_FOLDER = "index-v2"
+
+    /**
+     * Directory in the data directory that holds the pre-import copies of every live
+     * file an import is about to replace. It only exists while an import is in
+     * flight, see `SyncthingService.importConfig()`.
+     */
+    const val IMPORT_ROLLBACK_DIR: String = "import_rollback"
+
+    /**
+     * File written into [IMPORT_ROLLBACK_DIR] once an import has been published in
+     * full. A rollback directory without this marker means the import was interrupted
+     * and the copies must be put back.
+     */
+    const val IMPORT_COMMIT_MARKER: String = "committed.marker"
+
+    /**
+     * Name of the pre-import SharedPreferences snapshot inside [IMPORT_ROLLBACK_DIR].
+     */
+    const val IMPORT_PREFS_SNAPSHOT: String = "preferences.snapshot"
 
     @JvmStatic
     fun DYN_PREF_OBJECT_CUSTOM_SYNC_CONDITIONS(objectPrefixAndId: String?): String {
@@ -242,10 +260,6 @@ object Constants {
     @JvmStatic
     fun getConfigFile(context: Context): File {
         return File(context.filesDir, CONFIG_FILE)
-    }
-
-    fun getConfigTempFile(context: Context): File {
-        return File(context.filesDir, CONFIG_TEMP_FILE)
     }
 
     @JvmStatic
@@ -320,10 +334,7 @@ object Constants {
      * Syncthing v1.3.0+ attempts to enable the NAT feature.
      */
     fun osHasKernelBugIssue505(): Boolean {
-        val kernelVersion = System.getProperty("os.version")
-        if (kernelVersion == null) {
-            return false
-        }
+        val kernelVersion = System.getProperty("os.version") ?: return false
         /**
          * Affected kernels:
          * Samsung Note N7000 - LOS 16 - Android 9 - 3.0.101-gf32669ee5be #1 Tue Apr 7 20:05:58 +08 2020

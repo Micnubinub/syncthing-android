@@ -3,14 +3,16 @@ package com.micnubinub.syncthing.http
 import android.content.Context
 import android.util.Log
 import com.micnubinub.syncthing.http.SyncthingHttpClients.INITIAL_TIMEOUT_BACKOFF_MS
-import com.micnubinub.syncthing.http.SyncthingHttpClients.invalidate
+import com.micnubinub.syncthing.http.SyncthingHttpClients.inFlightCalls
 import com.micnubinub.syncthing.service.Constants
+import okhttp3.Call
 import okhttp3.ConnectionSpec
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Response
 import java.net.SocketTimeoutException
 import java.security.SecureRandom
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLSession
@@ -48,6 +50,40 @@ object SyncthingHttpClients {
 
     @Volatile
     private var client: OkHttpClient? = null
+
+    /**
+     * Calls handed out by [get] that have not finished yet.
+     *
+     * Every request talks to the one local core, so once that core is being shut down no
+     * outstanding request can still succeed. [cancelInFlightCalls] ends them instead of
+     * letting each hold an OkHttp dispatcher thread until it times out.
+     */
+    private val inFlightCalls = ConcurrentHashMap.newKeySet<Call>()
+
+    /**
+     * Tracks [call] until the caller reports it finished, so [cancelInFlightCalls] can
+     * end it. [untrack] must be called once the call is done.
+     */
+    internal fun track(call: Call): Call {
+        inFlightCalls += call
+        return call
+    }
+
+    /**
+     * Stops tracking [call], see [track].
+     */
+    internal fun untrack(call: Call) {
+        inFlightCalls -= call
+    }
+
+    /**
+     * Cancels every request that is still in flight, see [inFlightCalls]. Call this when
+     * the core goes away, before issuing any request that must still reach it.
+     */
+    internal fun cancelInFlightCalls() {
+        inFlightCalls.forEach { it.cancel() }
+        inFlightCalls.clear()
+    }
 
     @Synchronized
     fun get(context: Context?): OkHttpClient {

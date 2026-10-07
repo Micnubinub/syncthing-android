@@ -5,6 +5,7 @@ import android.content.ComponentCallbacks2
 import android.content.Intent
 import android.content.SharedPreferences
 import android.os.Environment
+import android.util.Base64
 import android.util.Log
 import androidx.core.content.edit
 import com.google.gson.Gson
@@ -12,6 +13,7 @@ import com.micnubinub.syncthing.R
 import com.micnubinub.syncthing.SyncthingApp
 import com.micnubinub.syncthing.http.PollWebGuiAvailableTask
 import com.micnubinub.syncthing.http.SyncthingHttpClients
+import com.micnubinub.syncthing.model.Device
 import com.micnubinub.syncthing.service.AppPrefs.getPrefVerboseLog
 import com.micnubinub.syncthing.service.Constants.DYN_PREF_OBJECT_CUSTOM_SYNC_CONDITIONS
 import com.micnubinub.syncthing.service.Constants.getConfigFile
@@ -21,6 +23,7 @@ import com.micnubinub.syncthing.service.Constants.getIndexDbFolder
 import com.micnubinub.syncthing.service.Constants.getPrivateKeyFile
 import com.micnubinub.syncthing.service.Constants.getPublicKeyFile
 import com.micnubinub.syncthing.service.Constants.getSharedPrefsFile
+import com.micnubinub.syncthing.util.CertificateValidator
 import com.micnubinub.syncthing.util.ConfigRouter
 import com.micnubinub.syncthing.util.ConfigXml
 import com.micnubinub.syncthing.util.ConfigXml.OpenConfigException
@@ -29,6 +32,7 @@ import com.micnubinub.syncthing.util.PermissionUtil.haveStoragePermission
 import com.micnubinub.syncthing.util.Util.isTcpPortListening
 import com.micnubinub.syncthing.util.Util.killProcess
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -39,6 +43,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import net.lingala.zip4j.ZipFile
 import net.lingala.zip4j.exception.ZipException
 import net.lingala.zip4j.model.ZipParameters
@@ -46,6 +51,8 @@ import net.lingala.zip4j.model.enums.AesKeyStrength
 import net.lingala.zip4j.model.enums.CompressionLevel
 import net.lingala.zip4j.model.enums.CompressionMethod
 import net.lingala.zip4j.model.enums.EncryptionMethod
+import org.w3c.dom.Element
+import org.xml.sax.InputSource
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -55,8 +62,15 @@ import java.io.InvalidClassException
 import java.io.ObjectInputStream
 import java.io.ObjectStreamClass
 import java.io.OutputStreamWriter
+import java.security.KeyFactory
+import java.security.cert.CertificateFactory
+import java.security.cert.X509Certificate
+import java.security.spec.PKCS8EncodedKeySpec
 import java.util.concurrent.CopyOnWriteArraySet
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import javax.inject.Inject
+import javax.xml.parsers.DocumentBuilderFactory
 
 /**
  * Holds the native syncthing instance and provides an API to access it.
@@ -108,10 +122,14 @@ class SyncthingService : Service() {
 
     @Volatile
     private var syncthingRunnableThread: Thread? = null
-    private lateinit var serviceScope: CoroutineScope
-    private lateinit var shutdownScope: CoroutineScope
-    private var deferredShutdownJob: Job? = null
-    private val shutdownMutex = Mutex()
+    private val serviceScope by lazy { CoroutineScope(SupervisorJob() + Dispatchers.Main) }
+    private val shutdownScope by lazy { CoroutineScope(SupervisorJob() + Dispatchers.IO) }
+    private val shutdownMutex: Mutex get() = coreLifecycleMutex
+
+    /**
+     * Hands out the generation numbers of [currentCoreGeneration]; only ever incremented.
+     */
+    private val coreGenerationCounter = AtomicInteger(0)
 
     @Volatile
     private var pollWebGuiAvailableTask: PollWebGuiAvailableTask? = null
@@ -126,6 +144,14 @@ class SyncthingService : Service() {
 
     @Volatile
     private var syncthingRunnable: SyncthingRunnable? = null
+
+    /**
+     * Number of the core generation this service started last. A crash report carries the
+     * number of the generation that produced it, so a report from a core that has already
+     * been replaced is recognized instead of stopping the current one.
+     */
+    @Volatile
+    private var currentCoreGeneration: Int = 0
 
     /**
      * Stores the result of the last should run decision received by OnShouldRunChangedListener.
@@ -147,8 +173,6 @@ class SyncthingService : Service() {
         ENABLE_VERBOSE_LOG = getPrefVerboseLog(preferences)
         LogV("onCreate")
         configRouter = ConfigRouter(this@SyncthingService)
-        serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
-        shutdownScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
         /**
          * If runtime permissions are revoked, android kills and restarts the service.
@@ -163,21 +187,22 @@ class SyncthingService : Service() {
      */
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.d(TAG, "onStartCommand")
+
+        /**
+         * Must run before anything that can asynchronously fail (e.g. the run
+         * condition monitor reading the config below) and before any early return.
+         * When this service was started via startForegroundService(), returning
+         * without startForeground() makes the system kill the app with
+         * ForegroundServiceDidNotStartInTimeException.
+         */
+        notificationHandler.updatePersistentNotification(this)
+
         if (!storagePermissionGranted) {
             Log.e(TAG, "User revoked storage permission. Stopping service.")
             notificationHandler.showStoragePermissionRevokedNotification()
             stopSelf()
             return START_NOT_STICKY
         }
-
-        /**
-         * Must run before anything that can asynchronously fail (e.g. the run
-         * condition monitor reading the config below). When this service was
-         * started via startForegroundService(), calling stopSelf() before
-         * startForeground() makes the system kill the app with
-         * ForegroundServiceDidNotStartInTimeException.
-         */
-        notificationHandler.updatePersistentNotification(this)
 
         // Run condition monitor is enabled.
         if (runConditionMonitor == null) {
@@ -215,13 +240,28 @@ class SyncthingService : Service() {
             }
         } else if (ACTION_STOP == intent.action) {
             if (intent.getBooleanExtra(EXTRA_STOP_AFTER_CRASHED_NATIVE, false)) {
+                val reportedGeneration =
+                    intent.getIntExtra(EXTRA_CORE_GENERATION, SyncthingRunnable.NO_GENERATION)
+                if (reportedGeneration != currentCoreGeneration) {
+                    /**
+                     * A crash report from a generation that is not the current one. Acting on
+                     * it would mark a healthy core - the one that replaced the reported
+                     * generation - as ERROR and stop it.
+                     */
+                    Log.w(
+                        TAG,
+                        "ACTION_STOP: Ignoring crash report of core generation " +
+                                "$reportedGeneration, current generation is $currentCoreGeneration"
+                    )
+                    return START_STICKY
+                }
                 /**
                  * We were requested to stop the service because the syncthing native binary crashed.
                  * Changing mCurrentState prevents the "defer until syncthing is started" routine we normally
                  * use for clean shutdown to take place. Instead, we will immediately shutdown the crashed
                  * instance forcefully.
                  */
-                synchronized(stateLock) { currentState = State.ERROR }
+                synchronized(stateLock) { onServiceStateChange(State.ERROR) }
                 shutdownScope.launch { shutdown(State.DISABLED) }
             } else {
                 // Graceful shutdown.
@@ -239,14 +279,21 @@ class SyncthingService : Service() {
              */
             Log.i(TAG, "Invoking reset of database")
             shutdownScope.launch {
-                if (synchronized(stateLock) { currentState } != State.DISABLED) {
-                    shutdown(State.DISABLED)
+                val shouldRestart = shutdownMutex.withLock {
+                    if (synchronized(stateLock) { currentState } != State.DISABLED) {
+                        shutdownLocked(State.DISABLED)
+                    }
+                    // The reset rewrites the index database, so it has to own
+                    // shutdownMutex for its whole run: a run condition flipping back to
+                    // "should run" in the gap would otherwise launch the core onto a
+                    // half-written database.
+                    SyncthingRunnable(
+                        this@SyncthingService,
+                        SyncthingRunnable.Command.resetdatabase
+                    ).run()
+                    synchronized(stateLock) { lastDeterminedShouldRun }
                 }
-                SyncthingRunnable(
-                    this@SyncthingService,
-                    SyncthingRunnable.Command.resetdatabase
-                ).run()
-                if (synchronized(stateLock) { lastDeterminedShouldRun }) {
+                if (shouldRestart) {
                     launchStartupTask(SyncthingRunnable.Command.main)
                 }
             }
@@ -269,41 +316,63 @@ class SyncthingService : Service() {
                 launchStartupTask(SyncthingRunnable.Command.resetdeltas)
                 if (!synchronized(stateLock) { lastDeterminedShouldRun }) {
                     // Shutdown if syncthing was not running before the UI action was raised.
+                    // launchStartupTask returns while the core is still STARTING, and a
+                    // shutdown at that point SIGKILLs it, which aborts the reset; wait for
+                    // the state that means the work is done.
+                    if (!awaitCoreSettled()) {
+                        Log.w(
+                            TAG,
+                            "ACTION_RESET_DELTAS: Core did not reach ACTIVE or ERROR in time, " +
+                                    "stopping it anyway"
+                        )
+                    }
                     shutdown(State.DISABLED)
                 }
             }
         } else if (ACTION_REFRESH_NETWORK_INFO == intent.action) {
             runConditionMonitor?.updateShouldRunDecision()
         } else if (ACTION_IGNORE_DEVICE == intent.action) {
-            configRouter?.ignoreDevice(
-                api,
-                intent.getStringExtra(EXTRA_DEVICE_ID) ?: "",
-                intent.getStringExtra(EXTRA_DEVICE_NAME) ?: "",
-                intent.getStringExtra(EXTRA_DEVICE_ADDRESS) ?: ""
-            )
-            notificationHandler.cancelConsentNotification(
-                intent.getIntExtra(
-                    EXTRA_NOTIFICATION_ID,
-                    0
+            val router = configRouter
+            val ignoredDevice = serviceScope.launch {
+                router?.ignoreDevice(
+                    api,
+                    intent.getStringExtra(EXTRA_DEVICE_ID) ?: "",
+                    intent.getStringExtra(EXTRA_DEVICE_NAME) ?: "",
+                    intent.getStringExtra(EXTRA_DEVICE_ADDRESS) ?: ""
                 )
-            )
+            }
+            ignoredDevice.invokeOnCompletion {
+                notificationHandler.cancelConsentNotification(
+                    intent.getIntExtra(
+                        EXTRA_NOTIFICATION_ID,
+                        0
+                    )
+                )
+            }
         } else if (ACTION_IGNORE_FOLDER == intent.action) {
-            configRouter?.ignoreFolder(
-                api,
-                intent.getStringExtra(EXTRA_DEVICE_ID) ?: "",
-                intent.getStringExtra(EXTRA_FOLDER_ID) ?: "",
-                intent.getStringExtra(EXTRA_FOLDER_LABEL) ?: ""
-            )
-            notificationHandler.cancelConsentNotification(
-                intent.getIntExtra(
-                    EXTRA_NOTIFICATION_ID,
-                    0
+            val router = configRouter
+            val ignoredFolder = serviceScope.launch {
+                router?.ignoreFolder(
+                    api,
+                    intent.getStringExtra(EXTRA_DEVICE_ID) ?: "",
+                    intent.getStringExtra(EXTRA_FOLDER_ID) ?: "",
+                    intent.getStringExtra(EXTRA_FOLDER_LABEL) ?: ""
                 )
-            )
+            }
+            ignoredFolder.invokeOnCompletion {
+                notificationHandler.cancelConsentNotification(
+                    intent.getIntExtra(
+                        EXTRA_NOTIFICATION_ID,
+                        0
+                    )
+                )
+            }
         } else if (ACTION_OVERRIDE_CHANGES == intent.action && synchronized(stateLock) { currentState == State.ACTIVE }) {
-            api?.overrideChanges(intent.getStringExtra(EXTRA_FOLDER_ID))
+            val folderId = intent.getStringExtra(EXTRA_FOLDER_ID)
+            serviceScope.launch { api?.overrideChanges(folderId) }
         } else if (ACTION_REVERT_LOCAL_CHANGES == intent.action && synchronized(stateLock) { currentState == State.ACTIVE }) {
-            api?.revertLocalChanges(intent.getStringExtra(EXTRA_FOLDER_ID))
+            val folderId = intent.getStringExtra(EXTRA_FOLDER_ID)
+            serviceScope.launch { api?.revertLocalChanges(folderId) }
         } else {
             afterFreshServiceInstanceStart()
         }
@@ -319,21 +388,29 @@ class SyncthingService : Service() {
         LogV("afterFreshServiceInstanceStart: Service started from scratch, SyncthingNative is going to STATE_$state meanwhilst ...")
         if (state == State.DISABLED) {
             serviceScope.launch {
-                // Read and parse the config from disk.
-                val configXml = ConfigXml(this@SyncthingService)
-                try {
-                    withContext(Dispatchers.IO) {
-                        configXml.loadConfig()
+                // A previous import may have been cut short by process death; put the
+                // original config back before anything reads it.
+                recoverInterruptedImport()
+
+                // Read and parse the config from disk. Held under the core lifecycle lock
+                // because the migration pass may write the file, and a core start must
+                // not interleave with that.
+                shutdownMutex.withLock {
+                    val configXml = ConfigXml(this@SyncthingService)
+                    try {
+                        withContext(Dispatchers.IO) {
+                            configXml.loadConfigAndUpdate()
+                        }
+                    } catch (e: OpenConfigException) {
+                        notificationHandler.showCrashedNotification(
+                            R.string.config_read_failed,
+                            "afterFreshServiceInstanceStart:OpenConfigException"
+                        )
+                        synchronized(stateLock) {
+                            onServiceStateChange(State.ERROR)
+                        }
+                        stopSelf()
                     }
-                } catch (e: OpenConfigException) {
-                    notificationHandler.showCrashedNotification(
-                        R.string.config_read_failed,
-                        "afterFreshServiceInstanceStart:OpenConfigException"
-                    )
-                    synchronized(stateLock) {
-                        onServiceStateChange(State.ERROR)
-                    }
-                    stopSelf()
                 }
             }
         }
@@ -403,217 +480,250 @@ class SyncthingService : Service() {
             }
         }
 
+        if (isCoreRunning) {
+            // The core owns config.xml already (it is starting up), so this is applied
+            // through the REST API instead - see [onApiAvailable], which re-runs this
+            // once the model is loaded.
+            Log.i(TAG, "applyCustomRunConditions: Core is up, deferring to the REST API")
+            return
+        }
+
+        // Owning shutdownMutex keeps a core start from interleaving with the pause
+        // writes below; the re-check catches a start that was queued ahead of us.
         serviceScope.launch {
-            var configChanged = false
-
-            // Read and parse the config from disk.
-            val configXml = ConfigXml(this@SyncthingService)
-            try {
-                withContext(Dispatchers.IO) {
-                    configXml.loadConfig()
+            shutdownMutex.withLock {
+                if (isCoreRunning) {
+                    Log.i(TAG, "applyCustomRunConditions: Core came up, deferring to the REST API")
+                    return@withLock
                 }
-            } catch (e: OpenConfigException) {
-                notificationHandler.showCrashedNotification(
-                    R.string.config_read_failed,
-                    "applyCustomRunConditions:OpenConfigException"
-                )
-                synchronized(stateLock) {
-                    onServiceStateChange(State.ERROR)
-                }
-                stopSelf()
-                return@launch
-            }
+                var configChanged = false
 
-            // Check if the folders are available from config.
-            for (folder in configXml.folders) {
-                // LogV("applyCustomRunConditions: Processing config of folder(" + folder.getLabel() + ")");
-                val folderCustomSyncConditionsEnabled = preferences.getBoolean(
-                    DYN_PREF_OBJECT_CUSTOM_SYNC_CONDITIONS(Constants.PREF_OBJECT_PREFIX_FOLDER + folder.id),
-                    false
-                )
-                if (folderCustomSyncConditionsEnabled) {
-                    val syncConditionsMet = runConditionMonitor.checkObjectSyncConditions(
-                        Constants.PREF_OBJECT_PREFIX_FOLDER + folder.id
+                // Read and parse the config from disk.
+                val configXml = ConfigXml(this@SyncthingService)
+                try {
+                    withContext(Dispatchers.IO) {
+                        configXml.loadConfig()
+                    }
+                } catch (e: OpenConfigException) {
+                    notificationHandler.showCrashedNotification(
+                        R.string.config_read_failed,
+                        "applyCustomRunConditions:OpenConfigException"
                     )
-                    LogV("applyCustomRunConditions: f(" + folder.label + ")=" + (if (syncConditionsMet) "1" else "0"))
-                    if (folder.paused == syncConditionsMet) {
-                        withContext(Dispatchers.IO) {
-                            configXml.setFolderPause(folder.id, !syncConditionsMet)
-                        }
-                        Log.d(
-                            TAG,
-                            "applyCustomRunConditions: f(" + folder.label + ")=" + (if (syncConditionsMet) ">1" else ">0")
+                    synchronized(stateLock) {
+                        onServiceStateChange(State.ERROR)
+                    }
+                    stopSelf()
+                    return@withLock
+                }
+
+                // Check if the folders are available from config.
+                for (folder in configXml.folders) {
+                    // LogV("applyCustomRunConditions: Processing config of folder(" + folder.getLabel() + ")");
+                    val folderCustomSyncConditionsEnabled = preferences.getBoolean(
+                        DYN_PREF_OBJECT_CUSTOM_SYNC_CONDITIONS(Constants.PREF_OBJECT_PREFIX_FOLDER + folder.id),
+                        false
+                    )
+                    if (folderCustomSyncConditionsEnabled) {
+                        val syncConditionsMet = runConditionMonitor.checkObjectSyncConditions(
+                            Constants.PREF_OBJECT_PREFIX_FOLDER + folder.id
                         )
-                        configChanged = true
+                        LogV("applyCustomRunConditions: f(" + folder.label + ")=" + (if (syncConditionsMet) "1" else "0"))
+                        if (folder.paused == syncConditionsMet) {
+                            withContext(Dispatchers.IO) {
+                                configXml.setFolderPause(folder.id, !syncConditionsMet)
+                            }
+                            Log.d(
+                                TAG,
+                                "applyCustomRunConditions: f(" + folder.label + ")=" + (if (syncConditionsMet) ">1" else ">0")
+                            )
+                            configChanged = true
+                        }
                     }
                 }
-            }
 
-            // Check if the devices are available from config.
-            val devices = withContext(Dispatchers.IO) {
-                configXml.getDevices(false).filterNotNull()
-            }
-            for (device in devices) {
-                // LogV("applyCustomRunConditions: Processing config of device(" + device.getName() + ")");
-                val deviceCustomSyncConditionsEnabled = preferences.getBoolean(
-                    DYN_PREF_OBJECT_CUSTOM_SYNC_CONDITIONS(Constants.PREF_OBJECT_PREFIX_DEVICE + device.deviceID),
-                    false
-                )
-                if (deviceCustomSyncConditionsEnabled) {
-                    val syncConditionsMet = runConditionMonitor.checkObjectSyncConditions(
-                        Constants.PREF_OBJECT_PREFIX_DEVICE + device.deviceID
+                // Check if the devices are available from config.
+                val devices = withContext(Dispatchers.IO) {
+                    configXml.getDevices(false).filterNotNull()
+                }
+                for (device in devices) {
+                    // LogV("applyCustomRunConditions: Processing config of device(" + device.getName() + ")");
+                    val deviceCustomSyncConditionsEnabled = preferences.getBoolean(
+                        DYN_PREF_OBJECT_CUSTOM_SYNC_CONDITIONS(Constants.PREF_OBJECT_PREFIX_DEVICE + device.deviceID),
+                        false
                     )
-                    LogV("applyCustomRunConditions: d(" + device.name + ")=" + (if (syncConditionsMet) "1" else "0"))
-                    if (device.paused == syncConditionsMet) {
-                        withContext(Dispatchers.IO) {
-                            configXml.setDevicePause(device.deviceID, !syncConditionsMet)
-                        }
-                        Log.d(
-                            TAG,
-                            "applyCustomRunConditions: d(" + device.name + ")=" + (if (syncConditionsMet) ">1" else ">0")
+                    if (deviceCustomSyncConditionsEnabled) {
+                        val syncConditionsMet = runConditionMonitor.checkObjectSyncConditions(
+                            Constants.PREF_OBJECT_PREFIX_DEVICE + device.deviceID
                         )
-                        configChanged = true
+                        LogV("applyCustomRunConditions: d(" + device.name + ")=" + (if (syncConditionsMet) "1" else "0"))
+                        if (device.paused == syncConditionsMet) {
+                            withContext(Dispatchers.IO) {
+                                configXml.setDevicePause(device.deviceID, !syncConditionsMet)
+                            }
+                            Log.d(
+                                TAG,
+                                "applyCustomRunConditions: d(" + device.name + ")=" + (if (syncConditionsMet) ">1" else ">0")
+                            )
+                            configChanged = true
+                        }
                     }
                 }
-            }
 
-            if (configChanged) {
-                LogV("applyCustomRunConditions: Saving changed config ...")
-                withContext(Dispatchers.IO) {
-                    configXml.saveChanges()
+                if (configChanged) {
+                    LogV("applyCustomRunConditions: Saving changed config ...")
+                    withContext(Dispatchers.IO) {
+                        configXml.saveChanges()
+                    }
+                } else {
+                    LogV("applyCustomRunConditions: No action was necessary.")
                 }
-            } else {
-                LogV("applyCustomRunConditions: No action was necessary.")
             }
         }
     }
 
     /**
      * Prepares to launch the syncthing binary.
+     *
+     * Shares [shutdownMutex] with [shutdown] so a start and a stop can never build up
+     * two native processes at once.
      */
     private suspend fun launchStartupTask(srCommand: SyncthingRunnable.Command) {
-        synchronized(stateLock) {
-            if (currentState != State.DISABLED && currentState != State.INIT) {
-                Log.e(
-                    TAG,
-                    "launchStartupTask: Wrong state $currentState detected. Cancelling."
+        shutdownMutex.withLock {
+            synchronized(stateLock) {
+                if (currentState != State.DISABLED && currentState != State.INIT) {
+                    Log.e(
+                        TAG,
+                        "launchStartupTask: Wrong state $currentState detected. Cancelling."
+                    )
+                    return@withLock
+                }
+                onServiceStateChange(State.STARTING)
+            }
+
+            config = ConfigXml(this)
+            try {
+                withContext(Dispatchers.IO) {
+                    // Migrations and repairs belong here, before the core reads the file.
+                    config?.loadConfigAndUpdate()
+                }
+            } catch (e: OpenConfigException) {
+                notificationHandler.showCrashedNotification(
+                    R.string.config_read_failed,
+                    "launchStartupTask:OpenConfigException"
                 )
-                return
+                synchronized(stateLock) {
+                    onServiceStateChange(State.ERROR)
+                }
+                stopSelf()
+                return@withLock
             }
-            onServiceStateChange(State.STARTING)
-        }
 
-        config = ConfigXml(this)
-        try {
-            withContext(Dispatchers.IO) {
-                config?.loadConfig()
-            }
-        } catch (e: OpenConfigException) {
-            notificationHandler.showCrashedNotification(
-                R.string.config_read_failed,
-                "launchStartupTask:OpenConfigException"
-            )
-            synchronized(stateLock) {
-                onServiceStateChange(State.ERROR)
-            }
-            stopSelf()
-            return
-        }
+            /**
+             * Reclaim an orphan of this app's own UID before anything else. An old core
+             * left behind by an app-process death (LMK, in-place upgrade) still holds the
+             * Web GUI port, so the port check below would report "second instance?" and
+             * strand the service in DISABLED while that orphan syncs unmanaged, with no
+             * retry. [Util.killProcess] only signals this UID and the exact binary name.
+             */
+            killProcess(Constants.FILENAME_SYNCTHING_BINARY)
 
-        // Check if the SyncthingNative's configured webgui port is allocated by another app or process.
-        val webGuiTcpPort = config?.webGuiBindPort
-        if (isTcpPortListening(webGuiTcpPort)) {
-            // We shouldn't start SyncthingNative as we would wait forever for life signs on the configured port. (ANR)
-            Log.e(
-                TAG,
-                "launchStartupTask: WebUI tcp port $webGuiTcpPort unavailable. Second instance?"
-            )
-            notificationHandler.showCrashedNotification(
-                R.string.webui_tcp_port_unavailable,
-                webGuiTcpPort.toString()
-            )
-            synchronized(stateLock) {
-                onServiceStateChange(State.DISABLED)
-            }
-            return
-        }
-
-        if (api == null) {
-            config?.webGuiUrl?.let {
-                api = RestApi(
-                    this, it, config?.apiKey,
-                    { onApiAvailable() }, {
-                        synchronized(stateLock) {
-                            onServiceStateChange(currentState)
-                        }
-                    })
-                Log.i(TAG, "Web GUI will be available at " + config?.webGuiUrl)
-            }
-        }
-
-        // Check syncthingRunnable lifecycle and create singleton.
-        if (syncthingRunnable != null || syncthingRunnableThread != null) {
-            Log.e(TAG, "onStartupTaskCompleteListener: Syncthing binary lifecycle violated")
-            synchronized(stateLock) {
-                onServiceStateChange(State.DISABLED)
-            }
-            return
-        }
-        syncthingRunnable = SyncthingRunnable(this, srCommand)
-
-        /**
-         * Check if an old syncthing instance is still running.
-         * This happens after an in-place app upgrade. If so, end it.
-         */
-        killProcess(Constants.FILENAME_SYNCTHING_BINARY)
-
-        // Start the syncthing binary in a separate thread.
-        val syncthingRunnableThreadExceptionHandler: Thread.UncaughtExceptionHandler =
-            Thread.UncaughtExceptionHandler { syncthingRunnableThread, ex ->
+            // Check if the SyncthingNative's configured webgui port is allocated by another app or process.
+            val webGuiTcpPort = config?.webGuiBindPort
+            if (isTcpPortListening(webGuiTcpPort)) {
+                // We shouldn't start SyncthingNative as we would wait forever for life signs on the configured port. (ANR)
                 Log.e(
                     TAG,
-                    "syncthingRunnableThread: Uncaught exception [ExecutableNotFoundException]"
+                    "launchStartupTask: WebUI tcp port $webGuiTcpPort unavailable. Second instance?"
                 )
                 notificationHandler.showCrashedNotification(
-                    R.string.executable_not_found,
-                    Constants.FILENAME_SYNCTHING_BINARY
+                    R.string.webui_tcp_port_unavailable,
+                    webGuiTcpPort.toString()
                 )
+                synchronized(stateLock) {
+                    onServiceStateChange(State.DISABLED)
+                }
+                return@withLock
             }
-        syncthingRunnableThread = Thread(syncthingRunnable)
-        syncthingRunnableThread?.uncaughtExceptionHandler =
-            syncthingRunnableThreadExceptionHandler
-        syncthingRunnableThread?.priority = Thread.MIN_PRIORITY
-        if (syncthingRunnableThread?.state == Thread.State.NEW) {
-            syncthingRunnableThread?.start()
-        } else {
-            Log.e(TAG, "launchStartupTask: Thread already started, skipping start()")
-        }
 
-        /**
-         * Wait for the web-gui of the native syncthing binary to come online.
-         * 
-         * In case the binary is to be stopped, also be aware that another thread could request
-         * to stop the binary in the time while waiting for the GUI to become active. See the comment
-         * for [onDestroy] for details.
-         */
-        if (pollWebGuiAvailableTask == null) {
-            config?.webGuiUrl?.let {
-                pollWebGuiAvailableTask = PollWebGuiAvailableTask(
-                    this, it, config?.apiKey,
-                    parentJob = serviceScope.coroutineContext[Job],
-                    listener = { result: String? ->
-                        Log.i(TAG, "Web GUI has come online at " + config?.webGuiUrl)
-                        api?.readConfigFromRestApi()
-                    }
-                )
+            if (api == null) {
+                config?.webGuiUrl?.let {
+                    api = RestApi(
+                        this, it, config?.apiKey,
+                        {
+                            onApiAvailable()
+                        }, {
+                            synchronized(stateLock) {
+                                onServiceStateChange(currentState)
+                            }
+                        }, { reason -> onApiUnavailable(reason) })
+                    Log.i(TAG, "Web GUI will be available at " + config?.webGuiUrl)
+                }
+            }
+
+            // Check syncthingRunnable lifecycle and create singleton.
+            if (syncthingRunnable != null || syncthingRunnableThread != null) {
+                Log.e(TAG, "onStartupTaskCompleteListener: Syncthing binary lifecycle violated")
+                synchronized(stateLock) {
+                    onServiceStateChange(State.DISABLED)
+                }
+                return@withLock
+            }
+            // Every start gets its own generation number, so a report that arrives late -
+            // after this core was replaced - can be recognized and ignored.
+            currentCoreGeneration = coreGenerationCounter.incrementAndGet()
+            syncthingRunnable = SyncthingRunnable(this, srCommand, currentCoreGeneration)
+
+            // Start the syncthing binary in a separate thread.
+            val syncthingRunnableThreadExceptionHandler: Thread.UncaughtExceptionHandler =
+                Thread.UncaughtExceptionHandler { syncthingRunnableThread, ex ->
+                    Log.e(
+                        TAG,
+                        "syncthingRunnableThread: Uncaught exception [ExecutableNotFoundException]"
+                    )
+                    notificationHandler.showCrashedNotification(
+                        R.string.executable_not_found,
+                        Constants.FILENAME_SYNCTHING_BINARY
+                    )
+                }
+            syncthingRunnableThread = Thread(syncthingRunnable)
+            syncthingRunnableThread?.uncaughtExceptionHandler =
+                syncthingRunnableThreadExceptionHandler
+            syncthingRunnableThread?.priority = Thread.MIN_PRIORITY
+            if (syncthingRunnableThread?.state == Thread.State.NEW) {
+                // From here the core owns config.xml, so no direct write may be started
+                // until [shutdownLocked] has confirmed the process is gone.
+                isCoreRunning = true
+                syncthingRunnableThread?.start()
+            } else {
+                Log.e(TAG, "launchStartupTask: Thread already started, skipping start()")
+            }
+
+            /**
+             * Wait for the web-gui of the native syncthing binary to come online.
+             * 
+             * In case the binary is to be stopped, also be aware that another thread could request
+             * to stop the binary in the time while waiting for the GUI to become active. See the comment
+             * for [onDestroy] for details.
+             */
+            if (pollWebGuiAvailableTask == null) {
+                config?.webGuiUrl?.let {
+                    pollWebGuiAvailableTask = PollWebGuiAvailableTask(
+                        this, it, config?.apiKey,
+                        parentJob = serviceScope.coroutineContext[Job],
+                        listener = { result: String? ->
+                            Log.i(TAG, "Web GUI has come online at " + config?.webGuiUrl)
+                            api?.readConfigFromRestApi()
+                        },
+                        onTimeout = { reason -> onApiUnavailable(reason) }
+                    )
+                }
             }
         }
-
     }
 
     /**
-     * Called when [RestApi.checkReadConfigFromRestApiCompleted] detects
-     * the RestApi class has been fully initialized.
+     * Called when [RestApi.readConfigFromRestApi] completed every startup snapshot of the
+     * current generation successfully and the RestApi class is fully initialized.
      * UI stressing results in mRestApi getting null on simultaneous shutdown, so
      * we check it for safety.
      */
@@ -633,10 +743,40 @@ class SyncthingService : Service() {
             onServiceStateChange(State.ACTIVE)
         }
 
+        // The core loaded the imported config and keys and came up, so a committed
+        // import has now proven itself and its retained rollback copies are garbage.
+        discardRetainedImportRollback()
+
         if (eventProcessor == null) {
             eventProcessor = EventProcessor(this@SyncthingService, api)
             eventProcessor?.start()
         }
+
+        // A sync-precondition change that arrived while the core was still starting could
+        // not be written to config.xml, so apply it now that the REST model is loaded.
+        runConditionMonitor?.let { applyCustomRunConditions(it) }
+    }
+
+    /**
+     * A startup snapshot of the running generation could not be read, or the Web GUI never
+     * became available. Activating on partial data would hand the UI a config that was
+     * never loaded, and waiting would strand the service in STARTING, so terminate what we
+     * own and report the failure.
+     */
+    private fun onApiUnavailable(reason: String) {
+        Log.e(TAG, "onApiUnavailable: $reason")
+        notificationHandler.showCrashedNotification(R.string.notification_crash_title, reason)
+        synchronized(stateLock) {
+            if (currentState != State.STARTING) {
+                Log.e(
+                    TAG,
+                    "onApiUnavailable: Wrong state $currentState detected. Cancelling callback."
+                )
+                return
+            }
+            onServiceStateChange(State.ERROR)
+        }
+        shutdownScope.launch { shutdown(State.DISABLED) }
     }
 
     override fun onBind(intent: Intent?): SyncthingServiceBinder {
@@ -663,41 +803,13 @@ class SyncthingService : Service() {
         pollWebGuiAvailableTask?.cancelRequestsAndCallback()
         pollWebGuiAvailableTask = null
 
-        // Capture the API reference before nulling it so the shutdown coroutine
-        // doesn't race the field becoming null.
-        val apiToShutdown = api
-        api = null
-
-        // Serialize the whole teardown under shutdownMutex and run the deferred
-        // shutdown on shutdownScope, which is not cancelled by the serviceScope
-        // cancellation below.
+        // shutdown() owns the whole teardown under shutdownMutex, so this path cannot
+        // interleave with a concurrent start or stop request. It runs on shutdownScope,
+        // which is not cancelled by the serviceScope cancellation below.
         shutdownScope.launch {
-            shutdownMutex.withLock {
-                apiToShutdown?.let {
-                    withContext(Dispatchers.IO) {
-                        it.shutdown()
-                    }
-                }
-
-                // Hard stop: if STARTING, kill the native process immediately
-                // rather than deferring shutdown onto a scope that is about to
-                // be cancelled.
-                if (synchronized(stateLock) { currentState } == State.STARTING) {
-                    Log.w(TAG, "onDestroy: State is STARTING, killing process immediately")
-                    withContext(Dispatchers.IO) {
-                        killProcess(Constants.FILENAME_SYNCTHING_BINARY)
-                    }
-                    synchronized(stateLock) { onServiceStateChange(State.DISABLED) }
-                }
-
-                shutdown(State.DISABLED)
-
-                // Only tear down the scope if shutdown completed; a shutdown
-                // deferred while STARTING re-schedules onto shutdownScope.
-                if (synchronized(stateLock) { currentState } != State.STARTING) {
-                    shutdownScope.cancel()
-                }
-            }
+            shutdown(State.DISABLED)
+            // Only tear down the scope once the teardown completed.
+            shutdownScope.cancel()
         }
         serviceScope.cancel()
         super.onDestroy()
@@ -723,55 +835,80 @@ class SyncthingService : Service() {
      * Stop SyncthingNative and all helpers like event processor and api handler.
      * Sets [.mCurrentState] to newState.
      * Performs a synchronous shutdown of the native binary.
+     *
+     * Returns only once the teardown has completed, so callers may replace the data
+     * directory right after. [shutdownMutex] is the single owner of the native
+     * lifecycle: start and stop requests are serialized instead of interleaving, and a
+     * stop arriving while the core is still [State.STARTING] force-kills the generation
+     * this service already owns instead of deferring behind a startup that may never
+     * complete.
      */
-    private suspend fun shutdown(newState: State) {
-        val stateNow = synchronized(stateLock) { currentState }
-        if (stateNow == State.STARTING) {
-            Log.w(TAG, "Deferring shutdown until State.STARTING was left")
-            deferredShutdownJob?.cancel()
-            deferredShutdownJob = shutdownScope.launch {
-                var attempts = 0
-                while (synchronized(stateLock) { currentState } == State.STARTING) {
-                    if (++attempts > SHUTDOWN_MAX_DEFERRED_ATTEMPTS) {
-                        Log.w(TAG, "shutdown: Timed out waiting for STARTING to end, proceeding")
-                        break
-                    }
-                    delay(1000L)
-                }
-                deferredShutdownJob = null
-                shutdown(newState)
-            }
-            return
-        }
+    private suspend fun shutdown(newState: State) = shutdownMutex.withLock {
+        shutdownLocked(newState)
+    }
+
+    /**
+     * Body of [shutdown], for callers that already hold [shutdownMutex] because they have
+     * to keep the core down for the whole of a longer operation (import, export, database
+     * reset, HTTPS certificate replacement). Releasing the mutex between the teardown and
+     * the file work would let a queued [launchStartupTask] bring the core up on a
+     * half-swapped data directory.
+     */
+    private suspend fun shutdownLocked(newState: State) {
+        // The Web UI does not serve while STARTING, so there is nothing to ask for a
+        // clean stop and the owned process has to be killed.
+        val wasStarting = synchronized(stateLock) { currentState } == State.STARTING
 
         synchronized(stateLock) {
             onServiceStateChange(newState)
         }
 
         pollWebGuiAvailableTask?.let {
-            pollWebGuiAvailableTask?.cancelRequestsAndCallback()
+            it.cancelRequestsAndCallback()
             pollWebGuiAvailableTask = null
         }
 
         eventProcessor?.let {
-            eventProcessor?.stop()
+            it.stop()
             eventProcessor = null
         }
 
         notificationHandler.cancelRestartNotification()
 
-        if (api != null && syncthingRunnable != null) {
+        // Tag the generation we own as intentionally stopping before anything can make
+        // it exit, so a clean exit code is not later mistaken for an unexpected death.
+        syncthingRunnable?.markShutdownRequested()
+
+        // Stop and clear the API only when this service created one, so a leftover
+        // reference can never outlive the core it belongs to.
+        if (!wasStarting) {
             api?.shutdown()
-            api = null
         }
+        api = null
 
         syncthingRunnable?.let { runnable ->
             // killProcess and the thread join are blocking (join may wait up to the
             // timeout and killProcess polls for process exit), so run them off main.
             withContext(Dispatchers.IO) {
-                // Primary: destroy the owned process directly (no shell ps match).
-                runnable.destroyProcess()
-                // Fallback: shell kill for any orphaned instances we don't own.
+                // The core was just told to shut down through the REST API. That path
+                // flushes the database and closes connections, and signalling the
+                // process first would abort it half-way, so give it a bounded window
+                // to finish on its own and only force it if it does not.
+                if (wasStarting) {
+                    Log.w(TAG, "shutdown: Core never finished starting, force-killing it")
+                    runnable.destroyProcess()
+                } else if (runnable.awaitProcessExit(GRACEFUL_SHUTDOWN_TIMEOUT_MS)) {
+                    Log.i(TAG, "Core exited on its own after the shutdown request")
+                } else {
+                    Log.w(
+                        TAG,
+                        "Core did not exit within ${GRACEFUL_SHUTDOWN_TIMEOUT_MS}ms, " +
+                                "forcing shutdown"
+                    )
+                    runnable.destroyProcess()
+                }
+                // Fallback: end orphaned instances of this app's own UID left behind
+                // by an in-place upgrade, which we have no process handle for.
                 killProcess(Constants.FILENAME_SYNCTHING_BINARY)
                 if (syncthingRunnableThread != null) {
                     LogV("Waiting for syncthingRunnableThread to finish after killProcess(Syncthing) ...")
@@ -791,6 +928,8 @@ class SyncthingService : Service() {
                 }
                 syncthingRunnable = null
             }
+            // The process is gone, so config.xml is ours again.
+            isCoreRunning = false
         }
 
         config = null
@@ -809,10 +948,93 @@ class SyncthingService : Service() {
     }
 
     /**
+     * Suspends until the core this service started has settled, i.e. reached
+     * [State.ACTIVE] (its startup work, e.g. a delta index reset, is done and the Web GUI
+     * is up) or [State.ERROR] (it never will be).
+     *
+     * @return false on timeout, so the caller can decide what to do with a core that never
+     * reported.
+     */
+    private suspend fun awaitCoreSettled(): Boolean {
+        val settled = CompletableDeferred<State>()
+        val resolved = AtomicBoolean(false)
+        val listener = OnServiceStateChangeListener { state ->
+            if ((state == State.ACTIVE || state == State.ERROR) &&
+                resolved.compareAndSet(false, true)
+            ) {
+                settled.complete(state)
+            }
+        }
+        registerOnServiceStateChangeListener(listener)
+        return try {
+            withTimeoutOrNull(MAINTENANCE_TIMEOUT_MS) { settled.await() } != null
+        } finally {
+            unregisterOnServiceStateChangeListener(listener)
+        }
+    }
+
+    /**
+     * Result of a maintenance reset that has to restart the core before it is complete.
+     */
+    enum class MaintenanceResult {
+        /**
+         * The core restarted and the REST API is available again, so the reset ran.
+         */
+        COMPLETED,
+
+        /**
+         * The core did not come back up, or did not come back up in time. The reset may or
+         * may not have run, so the caller must not report success.
+         */
+        FAILED,
+    }
+
+    /**
+     * Triggers a maintenance [action] and suspends until the restarted core is back up.
+     *
+     * Both resets tear the core down and build it up again, which is the only point at which
+     * they are actually done. Waiting for that point is what lets a caller acknowledge the
+     * action instead of toasting success the moment the intent was sent.
+     */
+    suspend fun performMaintenanceAndAwait(action: String): MaintenanceResult {
+        val pending = CompletableDeferred<MaintenanceResult>()
+        val resolved = AtomicBoolean(false)
+        var sawStarting = false
+        val listener = OnServiceStateChangeListener { state ->
+            if (!resolved.compareAndSet(false, true)) {
+                return@OnServiceStateChangeListener
+            }
+            if (state == State.ACTIVE) {
+                pending.complete(MaintenanceResult.COMPLETED)
+            } else if (state == State.ERROR || (sawStarting && state == State.DISABLED)) {
+                pending.complete(MaintenanceResult.FAILED)
+            } else {
+                resolved.set(false)
+                if (state == State.STARTING) {
+                    sawStarting = true
+                }
+            }
+        }
+        registerOnServiceStateChangeListener(listener)
+        return try {
+            val intent = Intent(this, SyncthingService::class.java).apply { this.action = action }
+            startService(intent)
+            withTimeoutOrNull(MAINTENANCE_TIMEOUT_MS) { pending.await() }
+                ?: MaintenanceResult.FAILED
+        } finally {
+            unregisterOnServiceStateChangeListener(listener)
+        }
+    }
+
+    /**
      * Register a listener for the syncthing API state changing.
      * The listener is called immediately with the current state, and again whenever the state
-     * changes. The call is always from the GUI thread.
-     * 
+     * changes.
+     *
+     * The immediate call happens on whichever thread registers, so a caller on a background
+     * thread has to be prepared for its listener to run there once. The later calls all come
+     * from [serviceScope], i.e. the GUI thread.
+     *
      * @see .unregisterOnServiceStateChangeListener
      */
     fun registerOnServiceStateChangeListener(listener: OnServiceStateChangeListener) {
@@ -889,91 +1111,156 @@ class SyncthingService : Service() {
         var failSuccess = true
         Log.d(TAG, "exportConfig BEGIN")
 
-        if (synchronized(stateLock) { currentState } != State.DISABLED) {
-            // Shutdown synchronously. The shutdown orchestration fields are
-            // only safe to mutate on the main thread, so route the state
-            // transition there even though we are running on the IO dispatcher.
-            withContext(Dispatchers.Main) {
-                shutdown(State.DISABLED)
+        // The whole export owns shutdownMutex: the archive is built from the live config,
+        // keys and index database, so a start slipping in between the teardown and the
+        // zip would capture a database the core is still writing.
+        val shouldRestart = shutdownMutex.withLock {
+            if (synchronized(stateLock) { currentState } != State.DISABLED) {
+                shutdownLocked(State.DISABLED)
             }
-        }
 
-        // All file and ZIP operations run off the main thread.
-        withContext(Dispatchers.IO) {
-            // Create export dir if non-existant.
-            val targetZip = backupZipFile
-            targetZip.parentFile?.mkdirs()
+            // All file and ZIP operations run off the main thread.
+            withContext(Dispatchers.IO) {
+                // Create export dir if non-existant.
+                val targetZip = backupZipFile
+                targetZip.parentFile?.mkdirs()
 
-            // Export SharedPreferences.
-            var sharedPreferencesFile = getSharedPrefsFile(this@SyncthingService)
+                // Export SharedPreferences.
+                var sharedPreferencesFile = getSharedPrefsFile(this@SyncthingService)
 
-            if (!sharedPreferencesFile.exists()) {
-                sharedPreferencesFile.createNewFile()
-            }
-            writeSharedPrefsJson(sharedPreferencesFile)
-
-            // Make a list of files to backup.
-            val includePaths = listOf<File>(
-                getConfigFile(this@SyncthingService),
-                getPrivateKeyFile(this@SyncthingService),
-                getPublicKeyFile(this@SyncthingService),
-                getHttpsCertFile(this@SyncthingService),
-                getHttpsKeyFile(this@SyncthingService),
-                getSharedPrefsFile(this@SyncthingService),
-                getIndexDbFolder(this@SyncthingService)
-            )
-
-            // If user set one, apply a password and encrypt the zip file.
-            val zipEncryptionPassword: String =
-                preferences.getString(Constants.PREF_BACKUP_PASSWORD, "") ?: ""
-
-            // Compress files to zip file.
-            try {
-                // Delete existing ZIP file to ensure we create a fresh archive instead of appending
-                if (targetZip.exists()) {
-                    targetZip.delete()
+                if (!sharedPreferencesFile.exists()) {
+                    sharedPreferencesFile.createNewFile()
                 }
+                writeSharedPrefsJson(sharedPreferencesFile)
 
-                val parameters = ZipParameters()
-                parameters.compressionMethod = CompressionMethod.DEFLATE
-                parameters.compressionLevel = CompressionLevel.NORMAL
+                // Make a list of files to backup.
+                val includePaths = listOf<File>(
+                    getConfigFile(this@SyncthingService),
+                    getPrivateKeyFile(this@SyncthingService),
+                    getPublicKeyFile(this@SyncthingService),
+                    getHttpsCertFile(this@SyncthingService),
+                    getHttpsKeyFile(this@SyncthingService),
+                    getSharedPrefsFile(this@SyncthingService),
+                    getIndexDbFolder(this@SyncthingService)
+                )
 
-                val zipFile = if (zipEncryptionPassword.isEmpty()) {
-                    parameters.isEncryptFiles = false
-                    ZipFile(targetZip)
-                } else {
-                    parameters.isEncryptFiles = true
-                    parameters.encryptionMethod = EncryptionMethod.AES
-                    parameters.aesKeyStrength = AesKeyStrength.KEY_STRENGTH_256
-                    ZipFile(targetZip, zipEncryptionPassword.toCharArray())
-                }
+                // If user set one, apply a password and encrypt the zip file.
+                val zipEncryptionPassword: String =
+                    preferences.getString(Constants.PREF_BACKUP_PASSWORD, "") ?: ""
 
-                // Add files.
-                for (includePath in includePaths) {
-                    if (includePath.exists() == true) {
-                        if (includePath.isFile) {
-                            zipFile.addFile(includePath, parameters)
-                        } else if (includePath.isDirectory) {
-                            zipFile.addFolder(includePath, parameters)
+                // Compress files to zip file.
+                // The archive is built next to the target under a unique temporary name and
+                // only renamed over the previous backup once it is complete and readable, so
+                // a failure part-way through leaves the last known-good backup in place
+                // instead of replacing it with a truncated one.
+                var tmpZip: File? = null
+                try {
+                    val archive = File.createTempFile(
+                        targetZip.name,
+                        ".tmp",
+                        targetZip.parentFile
+                    )
+                    tmpZip = archive
+
+                    val parameters = ZipParameters()
+                    parameters.compressionMethod = CompressionMethod.DEFLATE
+                    parameters.compressionLevel = CompressionLevel.NORMAL
+
+                    if (zipEncryptionPassword.isEmpty()) {
+                        parameters.isEncryptFiles = false
+                    } else {
+                        parameters.isEncryptFiles = true
+                        parameters.encryptionMethod = EncryptionMethod.AES
+                        parameters.aesKeyStrength = AesKeyStrength.KEY_STRENGTH_256
+                    }
+
+                    ZipFile(archive).use { zipFile ->
+                        if (zipEncryptionPassword.isNotEmpty()) {
+                            setZipPassword(zipFile, zipEncryptionPassword)
+                        }
+                        // Add files.
+                        for (includePath in includePaths) {
+                            if (includePath.exists() == true) {
+                                if (includePath.isFile) {
+                                    zipFile.addFile(includePath, parameters)
+                                } else if (includePath.isDirectory) {
+                                    zipFile.addFolder(includePath, parameters)
+                                }
+                            }
                         }
                     }
-                }
 
-                if (sharedPreferencesFile.exists() == true) {
-                    sharedPreferencesFile.delete()
+                    // Re-open the finished archive so we never publish a file that cannot
+                    // be read back (truncated write, out of space, encryption mismatch).
+                    validateExportArchive(archive, zipEncryptionPassword)
+
+                    // Same directory, so this is an atomic replace on the same filesystem.
+                    if (!archive.renameTo(targetZip)) {
+                        throw IOException(
+                            "Failed to replace backup '${targetZip.absolutePath}'"
+                        )
+                    }
+                    tmpZip = null
+                    Log.i(TAG, "exportConfig: wrote backup '${targetZip.absolutePath}'")
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                    Log.w(TAG, "exportConfig: Failed to export config, " + e.message)
+                    // Best effort: the previous backup, if any, is still intact.
+                    tmpZip?.delete()
+                    failSuccess = false
+                } finally {
+                    if (sharedPreferencesFile.exists() == true) {
+                        sharedPreferencesFile.delete()
+                    }
                 }
-            } catch (e: Exception) {
-                Log.w(TAG, "exportConfig: Failed to export config, " + e.message)
-                failSuccess = false
             }
+            synchronized(stateLock) { lastDeterminedShouldRun }
         }
         Log.d(TAG, "exportConfig END")
 
-        // Start syncthing after export if run conditions apply.
-        if (synchronized(stateLock) { lastDeterminedShouldRun }) {
+        // Start syncthing after export if run conditions apply, now that the data
+        // directory is complete and shutdownMutex has been released again.
+        if (shouldRestart) {
             serviceScope.launch { launchStartupTask(SyncthingRunnable.Command.main) }
         }
         return failSuccess
+    }
+
+    /**
+     * Verifies that [archive] is a readable zip and contains the files an
+     * [importConfig] needs, so a corrupt or truncated export is never installed as
+     * the user's backup.
+     *
+     * @throws ZipException if the archive cannot be opened or a required entry is
+     * missing.
+     */
+    private fun validateExportArchive(archive: File, zipEncryptionPassword: String) {
+        val checkFiles = listOf(
+            Constants.CONFIG_FILE,
+            Constants.PRIVATE_KEY_FILE,
+            Constants.PUBLIC_KEY_FILE,
+            Constants.SHARED_PREFS_FILE
+        )
+        ZipFile(archive).use { result ->
+            if (zipEncryptionPassword.isNotEmpty()) {
+                setZipPassword(result, zipEncryptionPassword)
+            }
+            for (checkFile in checkFiles) {
+                if (result.getFileHeader(checkFile) == null) {
+                    throw ZipException(
+                        "Exported archive is missing required file [$checkFile]"
+                    )
+                }
+            }
+        }
+    }
+
+    /**
+     * zip4j takes the archive password from the [ZipFile] instance, not from the
+     * per-entry [ZipParameters], so it has to be set before any add/extract call.
+     */
+    private fun setZipPassword(zipFile: ZipFile, password: String) {
+        zipFile.setPassword(password.toCharArray())
     }
 
     /**
@@ -985,6 +1272,32 @@ class SyncthingService : Service() {
      * 
      * @return True if the import was successful, false otherwise (eg if files aren't found).
      */
+    /**
+     * Runs [importConfig] on a scope this service owns and reports the outcome on the main
+     * thread.
+     *
+     * The import republishes the data directory and restarts the core, so its job must not
+     * belong to the screen that asked for it: leaving the settings screen (or rotating the
+     * device) mid-import would otherwise cancel the swap, and the next start would undo it
+     * without the user ever learning that the import had run at all.
+     */
+    fun importConfigAsync(onResult: (Boolean) -> Unit) {
+        shutdownScope.launch {
+            val success = importConfig()
+            serviceScope.launch { onResult(success) }
+        }
+    }
+
+    /**
+     * Runs [exportConfig] on a scope this service owns, see [importConfigAsync].
+     */
+    fun exportConfigAsync(onResult: (Boolean) -> Unit) {
+        shutdownScope.launch {
+            val success = exportConfig()
+            serviceScope.launch { onResult(success) }
+        }
+    }
+
     suspend fun importConfig(): Boolean {
         Log.d(TAG, "importConfig PRECHECK")
 
@@ -1023,7 +1336,8 @@ class SyncthingService : Service() {
                 val checkFiles = listOf(
                     Constants.CONFIG_FILE,
                     Constants.PRIVATE_KEY_FILE,
-                    Constants.PUBLIC_KEY_FILE
+                    Constants.PUBLIC_KEY_FILE,
+                    Constants.SHARED_PREFS_FILE
                 )
                 for (checkFile in checkFiles) {
                     if (result.getFileHeader(checkFile) == null) {
@@ -1047,112 +1361,496 @@ class SyncthingService : Service() {
         } ?: return false
 
         // Shutdown SyncthingNative.
-        var failSuccess = true
         Log.d(TAG, "importConfig BEGIN")
-        if (synchronized(stateLock) { currentState } != State.DISABLED) {
-            // Shutdown synchronously. The shutdown orchestration fields are
-            // only safe to mutate on the main thread, so route the state
-            // transition there even though we are running on the IO dispatcher.
-            withContext(Dispatchers.Main) {
-                shutdown(State.DISABLED)
+        // The swap replaces config, keys and the index database, so it owns
+        // shutdownMutex from the teardown until the last cleanup helper is done: a start
+        // slipping into the gap would run the core on a half-published data directory,
+        // and a second maintenance action would stack its own swap on top of this one.
+        val outcome = shutdownMutex.withLock {
+            if (synchronized(stateLock) { currentState } != State.DISABLED) {
+                shutdownLocked(State.DISABLED)
+            }
+
+            // An earlier import may have died after it had already begun replacing the
+            // live files but before it committed; undo that first so we never stack a
+            // second swap on top of a half-published config.
+            recoverInterruptedImport()
+
+            // Extract the zip to a staging directory first so a corrupt or
+            // incomplete archive cannot destroy the current config/index database.
+            val cacheDir = this@SyncthingService.cacheDir
+            val stagingDir = File(cacheDir, "import_staging_" + System.currentTimeMillis())
+            val rollbackDir = File(filesDir, Constants.IMPORT_ROLLBACK_DIR)
+            val outcome: ImportOutcome
+            try {
+                val extractSucceeded = withContext(Dispatchers.IO) {
+                    try {
+                        stagingDir.mkdirs()
+                        zipFile.extractAll(stagingDir.absolutePath)
+                        true
+                    } catch (e: ZipException) {
+                        Log.e(TAG, "importConfig: Failed to extract zip, " + e.message)
+                        false
+                    }
+                }
+                outcome = if (extractSucceeded) {
+                    // Fully parse and cross-check the staged archive. Nothing live has
+                    // been touched yet, so a rejected archive costs nothing.
+                    val staged = validateStagedImport(stagingDir)
+                    if (staged == null) {
+                        ImportOutcome.BROKEN
+                    } else {
+                        publishStagedImport(staged, rollbackDir)
+                    }
+                } else {
+                    ImportOutcome.BROKEN
+                }
+            } finally {
+                withContext(Dispatchers.IO) {
+                    deleteDirectoryRecursively(stagingDir)
+                }
+            }
+
+            if (outcome == ImportOutcome.COMMITTED) {
+                try {
+                    cleanupImportedFolderDatabases()
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                    Log.e(TAG, "importConfig: Failed to cleanup invalid folder databases", e)
+                }
+            }
+            outcome
+        }
+
+        // Restart only once the live state is known to be good: either the archive was
+        // published in full, or the originals were put back completely. An import that
+        // left the data directory in an unknown state must not bring the core up on it.
+        if (outcome != ImportOutcome.BROKEN && synchronized(stateLock) { lastDeterminedShouldRun }) {
+            serviceScope.launch { launchStartupTask(SyncthingRunnable.Command.main) }
+        }
+        return outcome == ImportOutcome.COMMITTED
+    }
+
+    /**
+     * How an import attempt ended, see [importConfig].
+     */
+    private enum class ImportOutcome {
+        /**
+         * The archive was validated, published in full and committed.
+         */
+        COMMITTED,
+
+        /**
+         * The archive was rejected or the swap failed; the previous config, keys,
+         * database and preferences are back in place.
+         */
+        ROLLED_BACK,
+
+        /**
+         * The live state could not be restored, so the app must not start on it.
+         */
+        BROKEN
+    }
+
+    /**
+     * A live file that was moved aside by [publishStagedImport] and can be put back by
+     * [restoreRollbacks].
+     */
+    private class ImportRollback(val live: File, val backup: File)
+
+    /**
+     * An extracted archive that passed every validation in [validateStagedImport] and
+     * may therefore replace the live data directory.
+     */
+    private class StagedImport(
+        /** Device ID carried by the imported certificate, cross-checked against the config. */
+        val deviceId: String,
+        /** Extracted SharedPreferences backup. */
+        val sharedPrefsFile: File,
+        /** Archive members to publish into the data directory, excluding the prefs backup. */
+        val entries: List<File>
+    )
+
+    /**
+     * Fully parses and cross-checks an extracted archive before it is allowed to replace
+     * anything live.
+     *
+     * Filenames alone prove nothing, so the staged set is checked for real: the config
+     * must parse and declare well-formed device IDs, one of which must be the identity
+     * of the imported certificate, the private key must be a readable PEM key, the
+     * preferences backup must deserialize, and the optional Web GUI certificate pair
+     * must parse whenever it is present.
+     *
+     * @return the staged set, or null when the archive must not be imported.
+     */
+    private fun validateStagedImport(stagingDir: File): StagedImport? {
+        for (name in importRequiredFiles) {
+            val file = File(stagingDir, name)
+            if (!file.isFile || file.length() == 0L) {
+                Log.e(TAG, "importConfig: Missing or empty file after extraction [$name]")
+                return null
             }
         }
 
-        // Extract the zip to a staging directory first so a corrupt or
-        // incomplete archive cannot destroy the current config/index database.
-        val cacheDir = this@SyncthingService.cacheDir
-        val stagingDir = File(cacheDir, "import_staging_" + System.currentTimeMillis())
-        val extractSucceeded = withContext(Dispatchers.IO) {
+        val configDeviceIds = readDeviceIdsFromConfig(File(stagingDir, Constants.CONFIG_FILE))
+        if (configDeviceIds.isEmpty()) {
+            Log.e(TAG, "importConfig: Imported config declares no valid device ID")
+            return null
+        }
+
+        val certDeviceId = readDeviceIdFromCertificate(File(stagingDir, Constants.PUBLIC_KEY_FILE))
+        if (certDeviceId == null) {
+            Log.e(TAG, "importConfig: Imported certificate is not a readable X.509 certificate")
+            return null
+        }
+        val knownAsThisDevice = configDeviceIds.any { it.equals(certDeviceId, ignoreCase = true) }
+        if (!knownAsThisDevice) {
+            Log.e(
+                TAG,
+                "importConfig: Imported certificate identifies as \"$certDeviceId\", which the imported config does not know - the archive mixes two identities"
+            )
+            return null
+        }
+
+        val privateKeyFile = File(stagingDir, Constants.PRIVATE_KEY_FILE)
+        val privateKeyBytes = privateKeyFile.readBytes()
+        if (!isReadablePrivateKey(privateKeyBytes)) {
+            Log.e(TAG, "importConfig: Imported private key is not a readable PEM key")
+            return null
+        }
+        if (CertificateValidator.keyBelongsToCertificate(
+                File(stagingDir, Constants.PUBLIC_KEY_FILE).readBytes(), privateKeyBytes
+            ) == CertificateValidator.Status.FAIL
+        ) {
+            Log.e(
+                TAG,
+                "importConfig: Imported private key does not belong to the imported certificate - the archive mixes two identities"
+            )
+            return null
+        }
+
+        // The Web GUI certificate pair is not in every archive (older exports predate
+        // it), but a half pair or an unparsable one is rejected.
+        val httpsCert = File(stagingDir, Constants.HTTPS_CERT_FILE)
+        val httpsKey = File(stagingDir, Constants.HTTPS_KEY_FILE)
+        if (httpsCert.isFile != httpsKey.isFile) {
+            Log.e(
+                TAG,
+                "importConfig: Imported archive contains only one half of the Web GUI certificate pair"
+            )
+            return null
+        }
+        if (httpsCert.isFile) {
+            if (readDeviceIdFromCertificate(httpsCert) == null) {
+                Log.e(TAG, "importConfig: Imported Web GUI certificate is not readable")
+                return null
+            }
+            if (!isReadablePrivateKey(httpsKey.readBytes())) {
+                Log.e(TAG, "importConfig: Imported Web GUI key is not a readable PEM key")
+                return null
+            }
+        }
+
+        val sharedPrefsFile = File(stagingDir, Constants.SHARED_PREFS_FILE)
+        val prefsBackup = try {
+            readSharedPrefs(sharedPrefsFile)
+        } catch (e: Exception) {
+            Log.e(TAG, "importConfig: Imported shared preferences backup is unreadable", e)
+            null
+        }
+        if (prefsBackup == null || prefsBackup.isEmpty) {
+            Log.e(TAG, "importConfig: Imported shared preferences backup is empty")
+            return null
+        }
+
+        return StagedImport(
+            deviceId = certDeviceId,
+            sharedPrefsFile = sharedPrefsFile,
+            entries = stagingDir.listFiles().orEmpty()
+                .filter { it.name != Constants.SHARED_PREFS_FILE }
+                .filter { File(it.name).name == it.name && it.name.isNotBlank() }
+        )
+    }
+
+    /**
+     * Publishes a validated [staged] archive over the live config, keys and database.
+     *
+     * Every live entry is first renamed into [rollbackDir] and the current preferences
+     * are snapshotted there, so an incomplete swap can be undone completely. The import
+     * only counts as done once [Constants.IMPORT_COMMIT_MARKER] is written: until then a
+     * process death leaves a rollback directory without a marker, which
+     * [recoverInterruptedImport] detects and undoes.
+     *
+     * @return [ImportOutcome.COMMITTED] when the archive is fully live, [ImportOutcome.ROLLED_BACK]
+     * when the originals are back, [ImportOutcome.BROKEN] when they could not be restored.
+     */
+    private suspend fun publishStagedImport(
+        staged: StagedImport,
+        rollbackDir: File
+    ): ImportOutcome {
+        val rollbacks = mutableListOf<ImportRollback>()
+        val prefsSnapshot = File(rollbackDir, Constants.IMPORT_PREFS_SNAPSHOT)
+        val preferencesBackedUp = AtomicBoolean(false)
+
+        val failed = withContext(Dispatchers.IO) {
+            if (!rollbackDir.isDirectory && !rollbackDir.mkdirs()) {
+                Log.e(TAG, "importConfig: Unable to create the rollback directory")
+                return@withContext true
+            }
+            writeSharedPrefsJson(prefsSnapshot)
+            preferencesBackedUp.set(true)
+
+            // Move the live entries aside first, so nothing is destroyed until every
+            // rename out of the way has succeeded.
+            for (entry in staged.entries) {
+                val live = File(filesDir, entry.name)
+                if (!live.exists()) {
+                    continue
+                }
+                if (!moveToRollback(live, rollbackDir, rollbacks)) {
+                    return@withContext true
+                }
+            }
+            // The database belongs to the previous identity unless the archive brings
+            // its own; either way it must be recoverable until the commit.
+            val indexDb = getIndexDbFolder(this@SyncthingService)
+            if (indexDb.exists() && staged.entries.none { it.name == indexDb.name }) {
+                if (!moveToRollback(indexDb, rollbackDir, rollbacks)) {
+                    return@withContext true
+                }
+            }
+
+            for (entry in staged.entries) {
+                if (!entry.renameTo(File(filesDir, entry.name))) {
+                    Log.e(TAG, "importConfig: Failed to publish [" + entry.name + "]")
+                    return@withContext true
+                }
+            }
+
+            // The cached device ID is derived from the certificate that just went live, so
+            // it has to move in the same commit as the rest of the preferences. Leaving
+            // the old one behind would mislabel every device in the restored config.
+            !importConfigSharedPrefs(
+                staged.sharedPrefsFile,
+                restoredDeviceId = staged.deviceId
+            )
+        }
+
+        if (failed) {
+            return withContext(Dispatchers.IO) {
+                if (restoreRollbacks(rollbacks, prefsSnapshot, preferencesBackedUp.get())) {
+                    ImportOutcome.ROLLED_BACK
+                } else {
+                    Log.e(
+                        TAG,
+                        "importConfig: Import failed and the previous config could not be restored"
+                    )
+                    ImportOutcome.BROKEN
+                }
+            }
+        }
+
+        // Everything is in place: publish the commit marker, which turns the rollback
+        // copies into garbage that the next import simply replaces.
+        return withContext(Dispatchers.IO) {
+            if (!File(rollbackDir, Constants.IMPORT_COMMIT_MARKER).createNewFile() && !File(
+                    rollbackDir,
+                    Constants.IMPORT_COMMIT_MARKER
+                ).exists()
+            ) {
+                Log.e(TAG, "importConfig: Failed to write the import commit marker")
+                return@withContext ImportOutcome.BROKEN
+            }
+            /**
+             * The rollback copies are deliberately kept, not deleted here: everything this
+             * device can check locally has passed, but whether the core accepts the
+             * imported config, keys and database is only known once it has started on
+             * them. [discardRetainedImportRollback] drops them after that.
+             */
+            // The archive may have brought a different Web GUI certificate. The pinned
+            // one is cached inside the shared OkHttp client, which would then refuse the
+            // core it is about to talk to, so drop it and let the next request rebuild.
+            SyncthingHttpClients.invalidate()
+            Log.i(TAG, "importConfig: Imported device identity \"${staged.deviceId}\"")
+            ImportOutcome.COMMITTED
+        }
+    }
+
+    /**
+     * Puts a file or directory back under its original name inside [rollbackDir].
+     *
+     * @return false when the move failed, in which case nothing was recorded.
+     */
+    private fun moveToRollback(
+        live: File,
+        rollbackDir: File,
+        rollbacks: MutableList<ImportRollback>
+    ): Boolean {
+        val backup = File(rollbackDir, live.name)
+        deleteDirectoryRecursively(backup)
+        if (!live.renameTo(backup)) {
+            Log.e(TAG, "importConfig: Failed to move [" + live.name + "] aside")
+            return false
+        }
+        rollbacks.add(ImportRollback(live, backup))
+        return true
+    }
+
+    /**
+     * Restores every entry moved aside by [publishStagedImport] and, when it was taken,
+     * the pre-import shared preferences.
+     *
+     * @return false when at least one entry could not be put back.
+     */
+    private fun restoreRollbacks(
+        rollbacks: List<ImportRollback>,
+        prefsSnapshot: File,
+        restorePreferences: Boolean
+    ): Boolean {
+        var ok = true
+        for (rollback in rollbacks) {
+            if (!rollback.backup.exists()) {
+                continue
+            }
+            deleteDirectoryRecursively(rollback.live)
+            if (!rollback.backup.renameTo(rollback.live)) {
+                Log.e(TAG, "importConfig: Failed to restore [" + rollback.live.name + "]")
+                ok = false
+            }
+        }
+        if (restorePreferences) {
+            if (!importConfigSharedPrefs(prefsSnapshot, skipFilteredPrefs = false)) {
+                Log.e(TAG, "importConfig: Failed to restore the previous shared preferences")
+                ok = false
+            }
+        }
+        deleteDirectoryRecursively(prefsSnapshot.parentFile)
+        return ok
+    }
+
+    /**
+     * Drops the rollback copies that a committed import kept, once the core has proven
+     * that it can run on the imported data directory.
+     *
+     * They have to outlive the commit marker because everything this device can check
+     * locally passes for a config the core still refuses to load, and the previous config
+     * is already gone by then.
+     */
+    private fun discardRetainedImportRollback() {
+        val rollbackDir = File(filesDir, Constants.IMPORT_ROLLBACK_DIR)
+        if (!rollbackDir.isDirectory ||
+            !File(rollbackDir, Constants.IMPORT_COMMIT_MARKER).exists()
+        ) {
+            return
+        }
+        serviceScope.launch(Dispatchers.IO) {
+            deleteDirectoryRecursively(rollbackDir)
+            Log.i(TAG, "discardRetainedImportRollback: Import confirmed by a successful start")
+        }
+    }
+
+    /**
+     * Undoes an import that was interrupted between the destructive swap and its commit
+     * marker (process death, battery pull, force stop). An import that reached the
+     * marker is complete and its rollback copies are discarded once the core is up.
+     */
+    private suspend fun recoverInterruptedImport() {
+        val rollbackDir = File(filesDir, Constants.IMPORT_ROLLBACK_DIR)
+        withContext(Dispatchers.IO) {
+            if (!rollbackDir.isDirectory ||
+                File(rollbackDir, Constants.IMPORT_COMMIT_MARKER).exists()
+            ) {
+                return@withContext
+            }
+            Log.w(TAG, "importConfig: Found an interrupted import, restoring the previous config")
+            val prefsSnapshot = File(rollbackDir, Constants.IMPORT_PREFS_SNAPSHOT)
+            val rollbacks = rollbackDir.listFiles().orEmpty()
+                .filter { it.name != Constants.IMPORT_COMMIT_MARKER && it.name != prefsSnapshot.name }
+                .map { ImportRollback(File(filesDir, it.name), it) }
+            restoreRollbacks(rollbacks, prefsSnapshot, prefsSnapshot.exists())
+        }
+    }
+
+    /**
+     * Reads the IDs of every device declared by a config file.
+     *
+     * @return the well-formed device IDs, or an empty set when the file does not parse
+     * or declares none.
+     */
+    private fun readDeviceIdsFromConfig(configFile: File): Set<String> {
+        val document = try {
+            FileInputStream(configFile).use { inputStream ->
+                val inputSource = InputSource(InputStreamReader(inputStream, Charsets.UTF_8))
+                inputSource.encoding = "UTF-8"
+                DocumentBuilderFactory.newInstance().newDocumentBuilder().parse(inputSource)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "importConfig: Failed to parse the imported config", e)
+            return emptySet()
+        }
+
+        val nodes = document.getElementsByTagName("device")
+        val deviceIds = mutableSetOf<String>()
+        for (i in 0 until nodes.length) {
+            val id = (nodes.item(i) as? Element)?.getAttribute("id") ?: continue
+            val device = Device().apply { deviceID = id }
+            if (device.checkDeviceID()) {
+                deviceIds.add(id)
+            }
+        }
+        return deviceIds
+    }
+
+    /**
+     * Reads the Syncthing device ID a certificate identifies as, i.e. the CN of its
+     * subject.
+     *
+     * @return the device ID, or null when the file is not a readable certificate.
+     */
+    private fun readDeviceIdFromCertificate(certFile: File): String? {
+        return try {
+            FileInputStream(certFile).use { inputStream ->
+                val leaf = CertificateFactory.getInstance("X.509")
+                    .generateCertificate(inputStream) as X509Certificate
+                leaf.subjectX500Principal.name.split(",")
+                    .map { it.trim() }
+                    .firstOrNull { it.startsWith("CN=", ignoreCase = true) }
+                    ?.substring(3)
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Returns whether the bytes are a private key this device can decode. Encrypted and
+     * legacy PKCS#1 keys only have to carry a PEM private key block; the Syncthing core
+     * remains the authority on whether it can use them.
+     */
+    private fun isReadablePrivateKey(keyBytes: ByteArray): Boolean {
+        val pem = String(keyBytes, Charsets.US_ASCII)
+        if (!pem.contains("PRIVATE KEY-----")) {
+            return false
+        }
+        if (!pem.contains("BEGIN PRIVATE KEY")) {
+            return true
+        }
+        val der = try {
+            val body = pem.substringAfter("-----BEGIN PRIVATE KEY-----")
+                .substringBefore("-----END PRIVATE KEY-----")
+                .filterNot { it.isWhitespace() }
+            Base64.decode(body, Base64.DEFAULT)
+        } catch (e: IllegalArgumentException) {
+            return false
+        }
+        return supportedKeyAlgorithms.any { algorithm ->
             try {
-                stagingDir.mkdirs()
-                zipFile.extractAll(stagingDir.absolutePath)
+                KeyFactory.getInstance(algorithm).generatePrivate(PKCS8EncodedKeySpec(der))
                 true
-            } catch (e: ZipException) {
-                Log.e(TAG, "importConfig: Failed to extract zip, " + e.message)
+            } catch (e: Exception) {
                 false
             }
         }
-        if (extractSucceeded) {
-            var swapSucceeded = true
-            withContext(Dispatchers.IO) {
-                // Check if necessary files are present after extraction.
-                val checkFiles = listOf(
-                    Constants.CONFIG_FILE,
-                    Constants.PRIVATE_KEY_FILE,
-                    Constants.PUBLIC_KEY_FILE,
-                    Constants.HTTPS_CERT_FILE,
-                    Constants.HTTPS_KEY_FILE,
-                    Constants.SHARED_PREFS_FILE
-                )
-                for (checkFile in checkFiles) {
-                    if (!File(stagingDir, checkFile).exists()) {
-                        Log.e(
-                            TAG,
-                            "importConfig: Missing file after extraction [" + checkFile + "]"
-                        )
-                        swapSucceeded = false
-                    }
-                }
-
-                // Only replace the live files once validation passed.
-                if (swapSucceeded) {
-                    // Remove database folder if it exists.
-                    val databasePath = getIndexDbFolder(this@SyncthingService)
-                    if (databasePath.exists()) {
-                        Log.d(TAG, "importConfig: Clearing index database")
-                        try {
-                            deleteDirectoryRecursively(databasePath)
-                        } catch (e: IOException) {
-                            Log.e(
-                                TAG,
-                                "Failed to delete directory '" + databasePath.absolutePath + "'" + e
-                            )
-                        }
-                    }
-
-                    stagingDir.listFiles()?.forEach { staged ->
-                        val target = File(filesDir, staged.name)
-                        if (target.exists()) {
-                            target.delete()
-                        }
-                        if (!staged.renameTo(target)) {
-                            Log.e(
-                                TAG,
-                                "importConfig: Failed to move staged file [" + staged.name + "]"
-                            )
-                            swapSucceeded = false
-                        }
-                    }
-                }
-            }
-            failSuccess = failSuccess && swapSucceeded
-
-            if (swapSucceeded) {
-                // Import shared preferences.
-                val sharedPreferencesFile = getSharedPrefsFile(this@SyncthingService)
-                if (sharedPreferencesFile.exists()) {
-                    Log.d(TAG, "importConfig: Importing shared preferences")
-                    failSuccess = failSuccess && importConfigSharedPrefs(sharedPreferencesFile)
-                    sharedPreferencesFile.delete()
-                }
-            }
-        } else {
-            failSuccess = false
-        }
-        deleteDirectoryRecursively(stagingDir)
-
-        try {
-            cleanupImportedFolderDatabases()
-        } catch (e: Exception) {
-            if (e is CancellationException) throw e
-            Log.e(TAG, "importConfig: Failed to cleanup invalid folder databases", e)
-        }
-
-        // Start syncthing after import if run conditions apply.
-        if (synchronized(stateLock) { lastDeterminedShouldRun }) {
-            serviceScope.launch { launchStartupTask(SyncthingRunnable.Command.main) }
-        }
-        return failSuccess
     }
 
     /**
@@ -1163,7 +1861,7 @@ class SyncthingService : Service() {
      * 
      * The bytes are expected to already be validated (see [com.micnubinub.syncthing.util.CertificateValidator]).
      * The whole start/stop lifecycle is marshalled onto the main thread because the binary
-     * orchestration fields are only safe to touch there.
+     * orchestration fields are only safe to touch there; the file work is dispatched to IO.
      */
     fun replaceHttpsCertificate(
         certPem: ByteArray?, keyPem: ByteArray?,
@@ -1189,38 +1887,42 @@ class SyncthingService : Service() {
         certPem: ByteArray?, keyPem: ByteArray?,
         listener: OnHttpsCertReplaceResultListener
     ) {
-        var attempts = 0
-        while (synchronized(stateLock) { currentState } == State.STARTING) {
-            if (++attempts > SHUTDOWN_MAX_DEFERRED_ATTEMPTS) {
-                Log.w(TAG, "doReplaceHttpsCertificate: Timed out waiting for STARTING to end")
-                break
-            }
-            delay(1000L)
-        }
-
         val certFile = getHttpsCertFile(this)
         val keyFile = getHttpsKeyFile(this)
 
-        // Stop the binary so it releases the cert/key before we overwrite them.
-        if (synchronized(stateLock) { currentState } != State.DISABLED) {
-            shutdown(State.DISABLED)
+        var writeFailure: IOException? = null
+        val (certBak, keyBak) = shutdownMutex.withLock {
+            // Stop the binary so it releases the cert/key before we overwrite them.
+            // The whole replacement runs under the mutex: a start slipping in between
+            // the teardown and the write would have the core bind the old certificate
+            // and rewrite the new one out from under it.
+            if (synchronized(stateLock) { currentState } != State.DISABLED) {
+                shutdownLocked(State.DISABLED)
+            }
+
+            withContext(Dispatchers.IO) {
+                val certBak = backupFile(certFile)
+                val keyBak = backupFile(keyFile)
+
+                try {
+                    writeBytesAtomic(certFile, certPem)
+                    writeBytesAtomic(keyFile, keyPem)
+                    restrictToOwner(keyFile)
+                } catch (e: IOException) {
+                    Log.e(TAG, "doReplaceHttpsCertificate: Failed to write new cert/key", e)
+                    writeFailure = e
+                    restoreFile(certBak, certFile)
+                    restoreFile(keyBak, keyFile)
+                }
+                Pair(certBak, keyBak)
+            }
         }
 
-        val certBak = backupFile(certFile)
-        val keyBak = backupFile(keyFile)
-
-        try {
-            writeBytesAtomic(certFile, certPem)
-            writeBytesAtomic(keyFile, keyPem)
-            restrictToOwner(keyFile)
-        } catch (e: IOException) {
-            Log.e(TAG, "doReplaceHttpsCertificate: Failed to write new cert/key", e)
-            restoreFile(certBak, certFile)
-            restoreFile(keyBak, keyFile)
-            if (lastDeterminedShouldRun) {
+        if (writeFailure != null) {
+            if (synchronized(stateLock) { lastDeterminedShouldRun }) {
                 launchStartupTask(SyncthingRunnable.Command.main)
             }
-            listener.onResult(HttpsCertReplaceResult.FAILED, e.message)
+            listener.onResult(HttpsCertReplaceResult.FAILED, writeFailure?.message)
             return
         }
 
@@ -1228,27 +1930,23 @@ class SyncthingService : Service() {
     }
 
     private suspend fun doResetHttpsCertificate(listener: OnHttpsCertReplaceResultListener) {
-        var attempts = 0
-        while (synchronized(stateLock) { currentState } == State.STARTING) {
-            if (++attempts > SHUTDOWN_MAX_DEFERRED_ATTEMPTS) {
-                Log.w(TAG, "doResetHttpsCertificate: Timed out waiting for STARTING to end")
-                break
-            }
-            delay(1000L)
-        }
-
         val certFile = getHttpsCertFile(this)
         val keyFile = getHttpsKeyFile(this)
 
-        if (synchronized(stateLock) { currentState } != State.DISABLED) {
-            shutdown(State.DISABLED)
-        }
+        val (certBak, keyBak) = shutdownMutex.withLock {
+            if (synchronized(stateLock) { currentState } != State.DISABLED) {
+                shutdownLocked(State.DISABLED)
+            }
 
-        val certBak = backupFile(certFile)
-        val keyBak = backupFile(keyFile)
-        // Removing the files makes syncthing generate a fresh self-signed certificate at startup.
-        deleteQuietly(certFile)
-        deleteQuietly(keyFile)
+            withContext(Dispatchers.IO) {
+                val certBak = backupFile(certFile)
+                val keyBak = backupFile(keyFile)
+                // Removing the files makes syncthing generate a fresh self-signed certificate at startup.
+                deleteQuietly(certFile)
+                deleteQuietly(keyFile)
+                Pair(certBak, keyBak)
+            }
+        }
 
         applyCertChangeWithVerify(certFile, keyFile, certBak, keyBak, listener)
     }
@@ -1449,68 +2147,109 @@ class SyncthingService : Service() {
         }
     }
 
-    private fun importConfigSharedPrefs(file: File?): Boolean {
-        if (file != null && file.exists()) {
-            var success = true
-            try {
-                val parsedPrefs = readSharedPrefs(file)
-                if (parsedPrefs == null || parsedPrefs.isEmpty) {
-                    Log.e(TAG, "importConfig: Invalid object stream")
-                    success = false
-                } else {
-                    // Store backup folder to restore it back later in the process.
-                    val relPathToZip: String = preferences.getString(
-                        Constants.PREF_BACKUP_REL_PATH_TO_ZIP,
-                        ""
-                    ) ?: ""
-                    val backupPassword: String =
-                        preferences.getString(Constants.PREF_BACKUP_PASSWORD, "").orEmpty()
-
-                    // Prepare a SharedPreferences commit.
-                    preferences.edit {
-                        clear()
-                        parsedPrefs.booleans?.forEach { (prefKey, value) ->
-                            if (!importConfigSkipPref(prefKey)) {
-                                putBoolean(prefKey, value)
-                            }
-                        }
-                        parsedPrefs.strings?.forEach { (prefKey, value) ->
-                            if (!importConfigSkipPref(prefKey)) {
-                                putString(prefKey, value)
-                            }
-                        }
-                        parsedPrefs.ints?.forEach { (prefKey, value) ->
-                            if (!importConfigSkipPref(prefKey)) {
-                                putInt(prefKey, value)
-                            }
-                        }
-                        parsedPrefs.longs?.forEach { (prefKey, value) ->
-                            if (!importConfigSkipPref(prefKey)) {
-                                putLong(prefKey, value)
-                            }
-                        }
-                        parsedPrefs.floats?.forEach { (prefKey, value) ->
-                            if (!importConfigSkipPref(prefKey)) {
-                                putFloat(prefKey, value)
-                            }
-                        }
-                        parsedPrefs.stringSets?.forEach { (prefKey, value) ->
-                            if (!importConfigSkipPref(prefKey)) {
-                                Log.i(TAG, "importConfig: Adding pref \"$prefKey\" to commit ...")
-                                value.let { putStringSet(prefKey, it) }
-                            }
-                        }
-                        putString(Constants.PREF_BACKUP_REL_PATH_TO_ZIP, relPathToZip)
-                        putString(Constants.PREF_BACKUP_PASSWORD, backupPassword)
-                    }
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "importConfig: Invalid object stream", e)
-                success = false
-            }
-            return success
+    /**
+     * Replaces [preferences] with the contents of a preferences backup file.
+     *
+     * @param skipFilteredPrefs when true the deprecated and cache keys listed in
+     * [importConfigSkipPref] are dropped, which is what an import wants. A rollback must
+     * restore them verbatim because [applySharedPrefsBackup] clears the whole map first.
+     * @param restoredDeviceId the identity the imported key pair and config agree on. It
+     * replaces the cached [Constants.PREF_LOCAL_DEVICE_ID] in the same commit, because
+     * the cache is derived from the certificate and must never outlive it.
+     * @return true when the backup was read and applied.
+     */
+    private fun importConfigSharedPrefs(
+        file: File?,
+        skipFilteredPrefs: Boolean = true,
+        restoredDeviceId: String? = null
+    ): Boolean {
+        if (file == null || !file.exists()) {
+            return false
         }
-        return false
+        return try {
+            val parsedPrefs = readSharedPrefs(file)
+            if (parsedPrefs == null || parsedPrefs.isEmpty) {
+                Log.e(TAG, "importConfig: Invalid object stream")
+                false
+            } else {
+                // The archive location and its password describe where to import from, not
+                // part of the backup, so they survive the import.
+                val relPathToZip: String = preferences.getString(
+                    Constants.PREF_BACKUP_REL_PATH_TO_ZIP,
+                    ""
+                ) ?: ""
+                val backupPassword: String =
+                    preferences.getString(Constants.PREF_BACKUP_PASSWORD, "").orEmpty()
+                val preserved = mutableMapOf(
+                    Constants.PREF_BACKUP_REL_PATH_TO_ZIP to relPathToZip,
+                    Constants.PREF_BACKUP_PASSWORD to backupPassword
+                )
+                if (restoredDeviceId != null) {
+                    preserved[Constants.PREF_LOCAL_DEVICE_ID] = restoredDeviceId
+                }
+                applySharedPrefsBackup(
+                    parsedPrefs,
+                    skipFilteredPrefs = skipFilteredPrefs,
+                    // A rollback restores the snapshot verbatim, so it carries its own
+                    // device ID and needs no preservation.
+                    preservedStrings = if (skipFilteredPrefs) preserved else emptyMap()
+                )
+                true
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "importConfig: Invalid object stream", e)
+            false
+        }
+    }
+
+    /**
+     * Replaces the whole [preferences] map with [backup]. Note this clears first, so a
+     * key that is not in [backup] is gone afterwards.
+     */
+    private fun applySharedPrefsBackup(
+        backup: SharedPrefsBackup,
+        skipFilteredPrefs: Boolean,
+        preservedStrings: Map<String, String> = emptyMap()
+    ) {
+        preferences.edit {
+            clear()
+            backup.booleans?.forEach { (prefKey, value) ->
+                if (!skipPref(prefKey, skipFilteredPrefs)) {
+                    putBoolean(prefKey, value)
+                }
+            }
+            backup.strings?.forEach { (prefKey, value) ->
+                if (!skipPref(prefKey, skipFilteredPrefs)) {
+                    putString(prefKey, value)
+                }
+            }
+            backup.ints?.forEach { (prefKey, value) ->
+                if (!skipPref(prefKey, skipFilteredPrefs)) {
+                    putInt(prefKey, value)
+                }
+            }
+            backup.longs?.forEach { (prefKey, value) ->
+                if (!skipPref(prefKey, skipFilteredPrefs)) {
+                    putLong(prefKey, value)
+                }
+            }
+            backup.floats?.forEach { (prefKey, value) ->
+                if (!skipPref(prefKey, skipFilteredPrefs)) {
+                    putFloat(prefKey, value)
+                }
+            }
+            backup.stringSets?.forEach { (prefKey, value) ->
+                if (!skipPref(prefKey, skipFilteredPrefs)) {
+                    Log.i(TAG, "importConfig: Adding pref \"$prefKey\" to commit ...")
+                    value.let { putStringSet(prefKey, it) }
+                }
+            }
+            preservedStrings.forEach { (prefKey, value) -> putString(prefKey, value) }
+        }
+    }
+
+    private fun skipPref(prefKey: String, skipFilteredPrefs: Boolean): Boolean {
+        return skipFilteredPrefs && importConfigSkipPref(prefKey)
     }
 
     /**
@@ -1828,6 +2567,29 @@ class SyncthingService : Service() {
          */
         const val EXTRA_STOP_AFTER_CRASHED_NATIVE: String =
             ".SyncthingService.EXTRA_STOP_AFTER_CRASHED_NATIVE"
+
+        /**
+         * The core generation a crash report was produced by, see
+         * [EXTRA_CORE_GENERATION].
+         */
+        const val EXTRA_CORE_GENERATION: String = ".SyncthingService.EXTRA_CORE_GENERATION"
+
+        /**
+         * Archive members without which an import cannot be trusted, because every one
+         * of them is required to bring the previous identity back up.
+         */
+        private val importRequiredFiles = listOf(
+            Constants.CONFIG_FILE,
+            Constants.PRIVATE_KEY_FILE,
+            Constants.PUBLIC_KEY_FILE,
+            Constants.SHARED_PREFS_FILE
+        )
+
+        /**
+         * Key algorithms a Syncthing device identity may use.
+         */
+        private val supportedKeyAlgorithms = listOf("EC", "RSA")
+
         private const val TAG = "SyncthingService"
 
         @Volatile
@@ -1836,11 +2598,43 @@ class SyncthingService : Service() {
             private set
 
         /**
+         * Serializes the native core lifecycle. Shared with [ConfigRouter] so that a
+         * direct config.xml write and a core start/stop can never overlap: config.xml
+         * belongs to the core for as long as it runs (see [isCoreRunning]), and the core
+         * may only be brought up while no such write is in flight.
+         */
+        val coreLifecycleMutex = Mutex()
+
+        /**
+         * True from the moment the native core is handed the config until its process is
+         * confirmed dead. Deliberately wider than "the service is running" and than
+         * "the REST API has a config": a direct config.xml write is only safe outside
+         * this window, because a core that is starting already owns the file.
+         */
+        @Volatile
+        @JvmStatic
+        var isCoreRunning = false
+            private set
+
+        /**
          * Backstop timeout for [.verifyRestartAndRollback] in case the state machine never reaches
          * a terminal state (e.g. the binary crashed via a path that doesn't transition to ERROR).
          */
         private const val HTTPS_CERT_VERIFY_TIMEOUT_MS: Long = 30000
-        private const val SHUTDOWN_MAX_DEFERRED_ATTEMPTS = 30
+
+        /**
+         * Backstop timeout for [.performMaintenanceAndAwait]: a database or delta reset
+         * restarts the core, and a reset that never brings it back must still resolve.
+         */
+        private const val MAINTENANCE_TIMEOUT_MS: Long = 60000
         private const val SYNCTHING_THREAD_JOIN_TIMEOUT_MS: Long = 10000
+
+        /**
+         * How long the core is given to complete the graceful shutdown it was asked for
+         * through `/rest/system/shutdown` before it is signalled instead. Long enough for
+         * a database flush on slow storage, short enough that stopping the service stays
+         * responsive.
+         */
+        private const val GRACEFUL_SHUTDOWN_TIMEOUT_MS: Long = 5000
     }
 }

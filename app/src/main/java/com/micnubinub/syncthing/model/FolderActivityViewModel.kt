@@ -30,6 +30,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileWriter
 import java.util.Random
@@ -135,6 +136,12 @@ class FolderActivityViewModel : ViewModel() {
     // Contains SAF readwrite access URI on API level >= Build.VERSION_CODES.LOLLIPOP (21)
     private var folderUri: Uri? = null
     private var devices: List<Device> = emptyList()
+
+    /**
+     * Share state of every device as it was loaded, so a save can tell the user's own
+     * edits apart from a share that was accepted elsewhere while the screen was open.
+     */
+    private var loadedDeviceShares: Map<String?, FolderDeviceShareState> = emptyMap()
     private val initializedSessionKey = AtomicReference<String?>()
 
     fun initialize(
@@ -166,9 +173,10 @@ class FolderActivityViewModel : ViewModel() {
         // so run them off the main thread.
         viewModelScope.launch(Dispatchers.IO) {
             var folderNeedsToUpdate: Boolean
+            val loadedFolder: Folder
             if (isCreateMode) {
                 Log.d(TAG, "Initializing create mode ...")
-                folder = Folder().apply {
+                loadedFolder = Folder().apply {
                     id = folderId ?: generateRandomFolderId()
                     label = folderLabel.orEmpty().trim()
                     paused = false
@@ -191,70 +199,76 @@ class FolderActivityViewModel : ViewModel() {
             } else {
                 Log.d(TAG, "Initializing edit mode: folder.id=$folderId")
                 // The REST API is not yet available at this point, read via ConfigXml.
-                folder = config.getFolders(null).firstOrNull { it.id == folderId }
-                folder?.let {
-                    config.getFolderIgnoreList(null, it) { folderIgnoreList ->
-                        if (initializedSessionKey.get() != sessionKey) {
-                            return@getFolderIgnoreList
-                        }
-                        folderIgnoreList?.ignore?.let { ignore ->
-                            _state.update {
-                                it.copy(
-                                    ignoreList = ignore.filterNotNull().joinToString("\n")
-                                )
-                            }
-                        }
-                    }
-                }
-                if (folder == null) {
+                val existingFolder = config.getFolders(null).firstOrNull { it.id == folderId }
+                if (existingFolder == null) {
                     Log.w(TAG, "Folder not found in config, maybe it was deleted?")
                     if (initializedSessionKey.get() == sessionKey) {
                         _events.trySend(FolderActivityEvent.Finish(Activity.RESULT_CANCELED))
                     }
                     return@launch
                 }
+                loadedFolder = existingFolder
+                config.getFolderIgnoreList(null, existingFolder) { folderIgnoreList ->
+                    if (initializedSessionKey.get() != sessionKey) {
+                        return@getFolderIgnoreList
+                    }
+                    folderIgnoreList?.ignore?.let { ignore ->
+                        _state.update {
+                            it.copy(
+                                ignoreList = ignore.joinToString("\n")
+                            )
+                        }
+                    }
+                }
                 folderNeedsToUpdate = false
             }
 
             // If set, automatically share the current folder with the given device.
             if (!shareWithDeviceId.isNullOrEmpty()) {
-                folder?.addDevice(SharedWithDevice().apply { deviceID = shareWithDeviceId })
+                loadedFolder.addDevice(SharedWithDevice().apply { deviceID = shareWithDeviceId })
                 folderNeedsToUpdate = true
             }
 
-            devices = config.getDevices(null, false)
+            val loadedDevices = config.getDevices(null, false)
 
-            val currentFolder = folder ?: return@launch
-            val canWriteToPath = checkWriteAccess()
+            val canWriteToPath = checkWriteAccess(loadedFolder)
             if (initializedSessionKey.get() != sessionKey) {
                 return@launch
+            }
+            val shareStates = buildDeviceShareStates(loadedFolder, loadedDevices)
+            // Publish the editable model and the device list on the main thread; both
+            // fields are only read and written there.
+            withContext(Dispatchers.Main.immediate) {
+                folder = loadedFolder
+                devices = loadedDevices
+                loadedDeviceShares = shareStates.associateBy { it.deviceId }
             }
             _state.update {
                 it.copy(
                     isCreateMode = isCreateMode,
                     expertMode = expertMode,
                     canWriteToPath = canWriteToPath,
-                    label = currentFolder.label,
-                    folderId = currentFolder.id.orEmpty(),
-                    path = currentFolder.path.orEmpty(),
-                    folderType = currentFolder.type,
-                    fsWatcherEnabled = currentFolder.fsWatcherEnabled,
-                    paused = currentFolder.paused,
+                    label = loadedFolder.label,
+                    folderId = loadedFolder.id.orEmpty(),
+                    path = loadedFolder.path.orEmpty(),
+                    folderType = loadedFolder.type,
+                    fsWatcherEnabled = loadedFolder.fsWatcherEnabled,
+                    paused = loadedFolder.paused,
                     customSyncConditions = !isCreateMode && preferences.getBoolean(
                         Constants.DYN_PREF_OBJECT_CUSTOM_SYNC_CONDITIONS(
-                            Constants.PREF_OBJECT_PREFIX_FOLDER + currentFolder.id
+                            Constants.PREF_OBJECT_PREFIX_FOLDER + loadedFolder.id
                         ),
                         false
                     ),
-                    pullOrder = currentFolder.order,
-                    versioningType = currentFolder.versioning?.type.orEmpty(),
-                    versioningParams = versioningParamsOf(currentFolder),
-                    ignoreDelete = currentFolder.ignoreDelete,
+                    pullOrder = loadedFolder.order,
+                    versioningType = loadedFolder.versioning?.type.orEmpty(),
+                    versioningParams = versioningParamsOf(loadedFolder),
+                    ignoreDelete = loadedFolder.ignoreDelete,
                     runScript = preferences.getBoolean(
-                        Constants.DYN_PREF_OBJECT_FOLDER_RUN_SCRIPT(currentFolder.id),
+                        Constants.DYN_PREF_OBJECT_FOLDER_RUN_SCRIPT(loadedFolder.id),
                         false
                     ),
-                    devices = buildDeviceShareStates(),
+                    devices = shareStates,
                     folderNeedsToUpdate = folderNeedsToUpdate
                 )
             }
@@ -369,9 +383,19 @@ class FolderActivityViewModel : ViewModel() {
             FolderActivityAction.DevicesChanged -> {
                 // ConfigRouter.getDevices can read the config XML from disk when the REST
                 // API is unavailable, so run it off the main thread.
-                viewModelScope.launch(Dispatchers.IO) {
-                    devices = config?.getDevices(restApi, false)?.filterNotNull().orEmpty()
-                    _state.update { it.copy(devices = buildDeviceShareStates()) }
+                viewModelScope.launch {
+                    val loadedDevices = withContext(Dispatchers.IO) {
+                        config?.getDevices(restApi, false)?.filterNotNull().orEmpty()
+                    }
+                    devices = loadedDevices
+                    _state.update {
+                        it.copy(
+                            devices = buildDeviceShareStates(
+                                folder,
+                                loadedDevices
+                            )
+                        )
+                    }
                 }
             }
 
@@ -394,29 +418,47 @@ class FolderActivityViewModel : ViewModel() {
     }
 
     private fun onFolderPathSelected(path: String?, uri: Uri?) {
+        // Capture the model on the main thread; the coroutine below must not read the
+        // shared field.
+        val currentFolder = folder
         if (path.isNullOrEmpty() || path == File.separator) {
-            folder?.path = ""
+            currentFolder?.path = ""
             folderUri = null
             // checkWriteAccess() performs blocking shell I/O; keep it off the main thread.
             viewModelScope.launch(Dispatchers.IO) {
-                val canWriteToPath = checkWriteAccess()
+                val canWriteToPath = checkWriteAccess(currentFolder)
                 _state.update { it.copy(path = "", canWriteToPath = canWriteToPath) }
             }
             // Suggest the user to select a folder on internal or external storage.
             toast(R.string.toast_invalid_folder_selected)
             return
         }
-        folder?.path = path
+        currentFolder?.path = path
         folderUri = uri
         Log.v(TAG, "onFolderPathSelected: Got directory path '$path'")
+        // Read on the main thread; the coroutine below must not read the shared state.
+        val isCreateMode = _state.value.isCreateMode
         // checkWriteAccess() performs blocking shell I/O; keep it off the main thread.
         viewModelScope.launch(Dispatchers.IO) {
-            val canWriteToPath = checkWriteAccess()
+            val canWriteToPath = checkWriteAccess(currentFolder)
+            if (!canWriteToPath && isCreateMode && currentFolder != null) {
+                /**
+                 * A folder that cannot be written to can only be a "sendonly" one, and
+                 * while a folder is being created that is the type it has to be created
+                 * with, so it belongs on the model that is posted to the config.
+                 *
+                 * An existing folder keeps its type: the probe also fails while the volume
+                 * is merely unavailable, and quietly turning a sendreceive folder into a
+                 * sendonly one would stop it from applying remote changes for good. The
+                 * read-only path is reported in the UI instead.
+                 */
+                currentFolder.type = Constants.FOLDER_TYPE_SEND_ONLY
+            }
             markNeedsUpdate {
                 it.copy(
                     path = path,
                     canWriteToPath = canWriteToPath,
-                    folderType = folder?.type ?: it.folderType
+                    folderType = currentFolder?.type ?: it.folderType
                 )
             }
         }
@@ -508,24 +550,33 @@ class FolderActivityViewModel : ViewModel() {
 
     private fun onDeleteConfirmed() {
         val folderId = folder?.id
-
-        if (folderId == Constants.syncthingCameraFolderId) {
-            // Remove consent to "Syncthing Camera" feature.
-            preferences?.edit {
-                putBoolean(Constants.PREF_ENABLE_SYNCTHING_CAMERA, false)
-            }
-        }
         _state.update { it.copy(showDeleteDialog = false, folderNeedsToUpdate = false) }
 
         // removeFolder performs blocking config I/O; keep it off the main thread.
         viewModelScope.launch(Dispatchers.IO) {
-            folderId?.let { config?.removeFolder(restApi, it) }
-            _events.trySend(FolderActivityEvent.Finish(Activity.RESULT_CANCELED))
+            val result = folderId?.let { config?.removeFolder(restApi, it) }
+                ?: RestApi.ConfigSaveResult.SKIPPED
+            if (result == RestApi.ConfigSaveResult.SAVED) {
+                if (folderId == Constants.syncthingCameraFolderId) {
+                    // Remove consent to "Syncthing Camera" feature, now that the folder it
+                    // granted is really gone. Clearing it earlier would leave the feature
+                    // permanently disallowed after a failed removal.
+                    preferences?.edit {
+                        putBoolean(Constants.PREF_ENABLE_SYNCTHING_CAMERA, false)
+                    }
+                }
+                _events.trySend(FolderActivityEvent.Finish(Activity.RESULT_CANCELED))
+            } else {
+                _events.trySend(
+                    FolderActivityEvent.ShowToast(R.string.config_save_failed, Toast.LENGTH_LONG)
+                )
+            }
         }
     }
 
     private fun onSave() {
         val currentFolder = folder
+        val currentUri = folderUri
         val currentState = _state.value
         if (currentFolder == null) {
             Log.e(TAG, "onSave: folder == null")
@@ -562,8 +613,19 @@ class FolderActivityViewModel : ViewModel() {
         if (currentState.isCreateMode) {
             Log.v(TAG, "onSave: Adding folder with ID = '${currentFolder.id}'")
             viewModelScope.launch(Dispatchers.IO) {
-                preCreateFolderStruct(folderUri, currentFolder.path)
-                config?.addFolder(restApi, currentFolder)
+                preCreateFolderStruct(currentUri, currentFolder.path)
+                val result = config?.addFolder(restApi, currentFolder)
+                    ?: RestApi.ConfigSaveResult.SKIPPED
+                if (result != RestApi.ConfigSaveResult.SAVED) {
+                    _state.update { it.copy(isSaving = false) }
+                    _events.trySend(
+                        FolderActivityEvent.ShowToast(
+                            R.string.config_save_failed,
+                            Toast.LENGTH_LONG
+                        )
+                    )
+                    return@launch
+                }
                 RunConditionBus.tryEmit(RunConditionEvent.SyncTriggerFired(true))
                 _state.update { it.copy(isSaving = false) }
                 _events.trySend(FolderActivityEvent.Finish(Activity.RESULT_OK))
@@ -597,13 +659,81 @@ class FolderActivityViewModel : ViewModel() {
                 val ignore: List<String> = currentState.ignoreList.split("\n")
                     .dropLastWhile { it.isEmpty() }
                     .map { it }
-                config?.postFolderIgnoreList(restApi, currentFolder, ignore)
+                val ignoreListSaved =
+                    config?.postFolderIgnoreList(restApi, currentFolder, ignore) ?: false
+                if (!ignoreListSaved) {
+                    // Reporting the save as successful would tell the user their ignore
+                    // patterns are in effect while the core never accepted them.
+                    _state.update { it.copy(isSaving = false) }
+                    _events.trySend(
+                        FolderActivityEvent.ShowToast(
+                            R.string.config_save_failed,
+                            Toast.LENGTH_LONG
+                        )
+                    )
+                    return@launch
+                }
             }
 
             // Update folder using RestApi or ConfigXml.
-            config?.updateFolder(restApi, currentFolder)
+            val result = config?.updateFolder(restApi, folderToSave(restApi, currentFolder))
+                ?: RestApi.ConfigSaveResult.SKIPPED
             _state.update { it.copy(isSaving = false) }
-            _events.trySend(FolderActivityEvent.Finish(Activity.RESULT_OK))
+            if (result == RestApi.ConfigSaveResult.SAVED) {
+                _events.trySend(FolderActivityEvent.Finish(Activity.RESULT_OK))
+            } else {
+                _events.trySend(
+                    FolderActivityEvent.ShowToast(R.string.config_save_failed, Toast.LENGTH_LONG)
+                )
+            }
+        }
+    }
+
+    /**
+     * Builds the object to post for an edited folder: the folder as it exists in the
+     * config right now, with only the fields this screen owns copied over from
+     * [edited]. Posting [edited] itself would be a snapshot taken when the screen was
+     * opened and would silently revert every concurrent change (introducer,
+     * auto-accept, Web UI, pause, a share accepted by another device).
+     *
+     * Falls back to [edited] when the folder cannot be re-read, so a save is never
+     * silently dropped.
+     */
+    private fun folderToSave(restApi: RestApi?, edited: Folder): Folder {
+        val live = config?.getFolders(restApi)?.firstOrNull { it.id == edited.id } ?: return edited
+        live.id = edited.id
+        live.label = edited.label
+        live.path = edited.path
+        live.type = edited.type
+        live.fsWatcherEnabled = edited.fsWatcherEnabled
+        live.paused = edited.paused
+        live.order = edited.order
+        live.ignoreDelete = edited.ignoreDelete
+        live.versioning = edited.versioning
+        mergeDeviceShares(live, edited)
+        return live
+    }
+
+    /**
+     * Applies only the device shares the user actually changed. Every other entry is left
+     * exactly as the config has it, so a share that appeared elsewhere is kept.
+     */
+    private fun mergeDeviceShares(live: Folder, edited: Folder) {
+        val editedShares = edited.devices.associateBy { it.deviceID }
+        for (deviceId in loadedDeviceShares.keys + editedShares.keys) {
+            val loaded = loadedDeviceShares[deviceId]
+            val wasShared = loaded?.shared == true
+            val nowShared = editedShares[deviceId]
+            val passwordChanged = nowShared != null &&
+                    loaded != null && nowShared.encryptionPassword != loaded.encryptionPassword
+            if (wasShared == (nowShared != null) && !passwordChanged) {
+                continue
+            }
+            if (nowShared == null) {
+                live.removeDevice(deviceId)
+            } else {
+                live.addDevice(nowShared)
+            }
         }
     }
 
@@ -684,22 +814,28 @@ class FolderActivityViewModel : ViewModel() {
      * Access level readonly: folder can only be configured "sendonly".
      * Access level readwrite: folder can be configured "sendonly" or "sendreceive".
      */
-    private fun checkWriteAccess(): Boolean {
-        val currentFolder = folder ?: return false
-        if (currentFolder.path.isNullOrEmpty()) {
+    /**
+     * Probes whether [folder]'s path can be written to and changes nothing: the answer
+     * belongs to the UI state, and folder.type is not this method's to decide.
+     */
+    private fun checkWriteAccess(folder: Folder?): Boolean {
+        if (folder == null) {
             return false
         }
-        val canWriteToPath = Util.nativeBinaryCanWriteToPath(currentFolder.path)
-        if (!canWriteToPath) {
-            // Force "sendonly" folder.
-            currentFolder.type = Constants.FOLDER_TYPE_SEND_ONLY
+        if (folder.path.isNullOrEmpty()) {
+            return false
         }
-        return canWriteToPath
+        return Util.nativeBinaryCanWriteToPath(folder.path)
     }
 
-    private fun buildDeviceShareStates(): List<FolderDeviceShareState> {
-        val currentFolder = folder ?: return emptyList()
-        return devices.map { device ->
+    private fun buildDeviceShareStates(
+        currentFolder: Folder?,
+        availableDevices: List<Device>
+    ): List<FolderDeviceShareState> {
+        if (currentFolder == null) {
+            return emptyList()
+        }
+        return availableDevices.map { device ->
             val sharedWithDevice = currentFolder.getDevice(device.deviceID)
             FolderDeviceShareState(
                 deviceId = device.deviceID,

@@ -329,6 +329,20 @@ class RemoteCompletion(enableVerboseLog: Boolean) {
     }
 
     /**
+     * Drops every cached device/folder entry. The cache is repopulated lazily on
+     * the next query or by the next event.
+     *
+     * Callers outside this class must go through here rather than clearing
+     * [deviceFolderMap] directly, otherwise they race the event-driven writes
+     * that hold [deviceFolderMapLock].
+     */
+    fun clear() {
+        synchronized(deviceFolderMapLock) {
+            deviceFolderMap.clear()
+        }
+    }
+
+    /**
      * Returns a deep copy of object.
      * 
      * This method uses Gson and only works with objects that can be converted with Gson.

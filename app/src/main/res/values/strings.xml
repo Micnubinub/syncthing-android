@@ -615,6 +615,7 @@
     <string name="clear_stversions_summary">Files are moved to .stversions directory when replaced or deleted by Syncthing. You can probably find and recover accidentially deleted files there, but outdated versions of the files take storage space on your device.</string>
     <string name="clear_stversions_question">This will delete all previous versions of files handled by Syncthing. Continue\?</string>
     <string name="clear_stversions_done">Successfully cleared .stversions folders.</string>
+    <string name="clear_stversions_failed">Some .stversions content could not be deleted. See the log for details.</string>
 
     <string name="download_support_bundle_title">Download Support Bundle</string>
 
@@ -631,6 +632,8 @@
     <string name="undo_ignored_devices_folders_title">Undo ignoring devices and folders</string>
     <string name="undo_ignored_devices_folders_question">This will undo previous decisions to ignore devices and folders. Continue\?</string>
     <string name="undo_ignored_devices_folders_done">Successfully undone decisions.</string>
+    <string name="undo_ignored_devices_folders_failed">Could not undo the ignore decisions. Syncthing did not accept the config.</string>
+    <string name="config_save_failed">Syncthing did not accept the change. Please try again.</string>
 
     <string name="backup_rel_path_to_zip">Relative path to config archive</string>
 
@@ -714,6 +717,7 @@
 \nAre you sure you want to clear Syncthing\'s database\?</string>
     <!-- Syncthing was reset -->
     <string name="st_reset_database_done">Successfully reset Syncthing\'s database</string>
+    <string name="st_reset_database_failed">Could not reset Syncthing\'s database. Syncthing did not come back up.</string>
 
     <!-- Title for the preference to reset Syncthing indexes -->
     <string name="st_reset_deltas_title">Reset Delta Indexes</string>
@@ -722,6 +726,7 @@
 \nAre you sure you want to clear Syncthing\'s delta indexes\?</string>
     <!-- Syncthing was reset -->
     <string name="st_reset_deltas_done">Successfully reset Syncthing\'s delta indexes</string>
+    <string name="st_reset_deltas_failed">Could not reset Syncthing\'s delta indexes. Syncthing did not come back up.</string>
 
     <!-- Settings / About -->
     <string name="category_about">About</string>
