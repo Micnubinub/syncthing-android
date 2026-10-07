@@ -20,7 +20,7 @@ class LocalCompletion(enableVerboseLog: Boolean) {
     private val gson = Gson()
     private var ENABLE_VERBOSE_LOG = false
 
-    val folderMap: HashMap<String, FolderStatusMap?> = HashMap<String, FolderStatusMap?>()
+    val folderMap: HashMap<String, FolderStatusMap?> = HashMap()
 
     /**
      * Object that must be locked upon accessing mFolderMapLock.
@@ -63,8 +63,8 @@ class LocalCompletion(enableVerboseLog: Boolean) {
             for (folder in newFolders) {
                 folder.id?.let { id ->
                     if (!folderMap.containsKey(id)) {
-                        LogV("updateFromConfig: Add folder '" + id + "' to cache model.")
-                        folderMap[id] = AbstractMap.SimpleEntry<FolderStatus, CachedFolderStatus?>(
+                        LogV("updateFromConfig: Add folder '$id' to cache model.")
+                        folderMap[id] = AbstractMap.SimpleEntry(
                             FolderStatus(),
                             CachedFolderStatus()
                         )
@@ -121,7 +121,7 @@ class LocalCompletion(enableVerboseLog: Boolean) {
     fun getFolderStatus(folderId: String?): FolderStatusMapNonNull {
         synchronized(mFolderMapLock) {
             if (!folderMap.containsKey(folderId)) {
-                return AbstractMap.SimpleEntry<FolderStatus, CachedFolderStatus>(
+                return AbstractMap.SimpleEntry(
                     FolderStatus(),
                     CachedFolderStatus()
                 )
@@ -177,7 +177,7 @@ class LocalCompletion(enableVerboseLog: Boolean) {
             folderId?.let {
                 folderMap.put(
                     folderId,
-                    AbstractMap.SimpleEntry<FolderStatus, CachedFolderStatus?>(
+                    AbstractMap.SimpleEntry(
                         folderStatus,
                         cachedFolderStatus
                     )
@@ -218,7 +218,7 @@ class LocalCompletion(enableVerboseLog: Boolean) {
             // Add folder or update existing folder entry.
             folderMap.put(
                 folderId,
-                AbstractMap.SimpleEntry<FolderStatus, CachedFolderStatus?>(
+                AbstractMap.SimpleEntry(
                     cacheEntry.key,
                     cachedFolderStatus
                 )
@@ -239,7 +239,7 @@ class LocalCompletion(enableVerboseLog: Boolean) {
             folderId?.let {
                 folderMap.put(
                     folderId,
-                    AbstractMap.SimpleEntry<FolderStatus, CachedFolderStatus?>(
+                    AbstractMap.SimpleEntry(
                         cacheEntry.key,
                         cachedFolderStatus
                     )
@@ -261,7 +261,7 @@ class LocalCompletion(enableVerboseLog: Boolean) {
             folderId?.let {
                 folderMap.put(
                     folderId,
-                    AbstractMap.SimpleEntry<FolderStatus, CachedFolderStatus?>(
+                    AbstractMap.SimpleEntry(
                         cacheEntry.key,
                         cachedFolderStatus
                     )
@@ -271,12 +271,26 @@ class LocalCompletion(enableVerboseLog: Boolean) {
     }
 
     /**
+     * Drops every cached folder entry. The cache is repopulated lazily on the
+     * next query or by the next event.
+     *
+     * Callers outside this class must go through here rather than clearing
+     * [folderMap] directly, otherwise they race the event-driven writes that
+     * hold [mFolderMapLock].
+     */
+    fun clear() {
+        synchronized(mFolderMapLock) {
+            folderMap.clear()
+        }
+    }
+
+    /**
      * Returns a deep copy of object.
      * 
      * This method uses Gson and only works with objects that can be converted with Gson.
      */
     private fun <T> deepCopy(obj: T?, type: Type): T? {
-        return gson.fromJson<T?>(gson.toJson(obj, type), type)
+        return gson.fromJson(gson.toJson(obj, type), type)
     }
 
     private fun LogV(logMessage: String) {

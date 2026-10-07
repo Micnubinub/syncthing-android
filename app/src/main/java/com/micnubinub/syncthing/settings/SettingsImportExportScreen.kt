@@ -39,10 +39,6 @@ import androidx.navigation3.runtime.EntryProviderScope
 import com.micnubinub.syncthing.R
 import com.micnubinub.syncthing.navigation.LocalSyncthingService
 import com.micnubinub.syncthing.service.Constants
-import com.micnubinub.syncthing.util.LocalActivityScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import me.zhanghai.compose.preference.LocalPreferenceFlow
 import me.zhanghai.compose.preference.LocalPreferenceTheme
 import me.zhanghai.compose.preference.Preference
@@ -51,13 +47,11 @@ import me.zhanghai.compose.preference.TextFieldPreference
 import me.zhanghai.compose.preference.TwoTargetPreference
 import me.zhanghai.compose.preference.rememberPreferenceState
 
-
 fun EntryProviderScope<SettingsRoute>.settingsImportExportEntry() {
     entry<SettingsRoute.ImportExport> {
         SettingsImportExportScreen()
     }
 }
-
 
 @Composable
 fun SettingsImportExportScreen() {
@@ -205,7 +199,6 @@ private fun PasswordPreference() {
 @Composable
 private fun ExportConfigPreference() {
     val context = LocalContext.current
-    val scope = LocalActivityScope.current
     val navigator = LocalSettingsNavigator.current
     val stService = LocalSyncthingService.current
     val rootNavigator = com.micnubinub.syncthing.navigation.LocalRootNavigator.current
@@ -228,25 +221,21 @@ private fun ExportConfigPreference() {
                     onClick = {
                         showAlert = false
                         stService?.let { service ->
-                            scope.launch(Dispatchers.IO) {
-                                service.exportConfig().also { success ->
-                                    withContext(Dispatchers.Main) {
-                                        if (success) {
-                                            Toast.makeText(
-                                                context,
-                                                R.string.config_export_successful_no_path,
-                                                Toast.LENGTH_LONG
-                                            ).show()
-                                            navigator.navigateUp()
-                                        } else {
-                                            Toast.makeText(
-                                                context,
-                                                R.string.config_export_failed,
-                                                Toast.LENGTH_LONG
-                                            ).show()
-                                            rootNavigator.navigateTo(logRoute)
-                                        }
-                                    }
+                            service.exportConfigAsync { success ->
+                                if (success) {
+                                    Toast.makeText(
+                                        context,
+                                        R.string.config_export_successful_no_path,
+                                        Toast.LENGTH_LONG
+                                    ).show()
+                                    navigator.navigateUp()
+                                } else {
+                                    Toast.makeText(
+                                        context,
+                                        R.string.config_export_failed,
+                                        Toast.LENGTH_LONG
+                                    ).show()
+                                    rootNavigator.navigateTo(logRoute)
                                 }
                             }
                         }
@@ -269,7 +258,6 @@ private fun ExportConfigPreference() {
 @Composable
 private fun ImportConfigPreference() {
     val context = LocalContext.current
-    val scope = LocalActivityScope.current
     val navigator = LocalSettingsNavigator.current
     val stService = LocalSyncthingService.current
     val prefs = LocalPreferenceFlow.current
@@ -293,36 +281,32 @@ private fun ImportConfigPreference() {
                     onClick = {
                         showAlert = false
                         stService?.let { service ->
-                            scope.launch(Dispatchers.IO) {
-                                service.importConfig().also { success ->
-                                    withContext(Dispatchers.Main) {
-                                        if (success) {
-                                            Toast.makeText(
-                                                context,
-                                                R.string.config_imported_successful,
-                                                Toast.LENGTH_LONG
-                                            ).show()
+                            service.importConfigAsync { success ->
+                                if (success) {
+                                    Toast.makeText(
+                                        context,
+                                        R.string.config_imported_successful,
+                                        Toast.LENGTH_LONG
+                                    ).show()
 
-                                            // apply theme from restored config
-                                            val raw: Any? = prefs.value[Constants.PREF_APP_THEME]
-                                            val theme = when (raw) {
-                                                is Int -> raw
-                                                is String -> raw.toIntOrNull()
-                                                else -> null
-                                            } ?: AppCompatDelegate.MODE_NIGHT_FOLLOW_SYSTEM
-                                            AppCompatDelegate.setDefaultNightMode(theme)
+                                    // apply theme from restored config
+                                    val raw: Any? = prefs.value[Constants.PREF_APP_THEME]
+                                    val theme = when (raw) {
+                                        is Int -> raw
+                                        is String -> raw.toIntOrNull()
+                                        else -> null
+                                    } ?: AppCompatDelegate.MODE_NIGHT_FOLLOW_SYSTEM
+                                    AppCompatDelegate.setDefaultNightMode(theme)
 
-                                            service.evaluateRunConditions()
-                                            navigator.navigateUp()
-                                        } else {
-                                            Toast.makeText(
-                                                context,
-                                                R.string.config_import_failed_no_path,
-                                                Toast.LENGTH_LONG
-                                            ).show()
-                                            rootNavigator.navigateTo(logRoute)
-                                        }
-                                    }
+                                    service.evaluateRunConditions()
+                                    navigator.navigateUp()
+                                } else {
+                                    Toast.makeText(
+                                        context,
+                                        R.string.config_import_failed_no_path,
+                                        Toast.LENGTH_LONG
+                                    ).show()
+                                    rootNavigator.navigateTo(logRoute)
                                 }
                             }
                         }

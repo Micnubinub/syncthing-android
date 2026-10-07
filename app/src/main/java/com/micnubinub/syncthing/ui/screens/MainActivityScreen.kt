@@ -152,6 +152,7 @@ fun MainActivityScreen(
     val deviceIdDialog by viewModel.deviceIdDialog.collectAsStateWithLifecycle()
     val usageReportingDialog by viewModel.usageReportingDialog.collectAsStateWithLifecycle()
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val scope = rememberCoroutineScope()
 
     MainActivityContent(
         serviceState = serviceState,
@@ -179,13 +180,13 @@ fun MainActivityScreen(
                 when (choice) {
                     UsageReportingChoice.ACCEPT -> {
                         api?.setUsageReporting(true)
-                        api?.sendConfig()
+                        scope.launch { api?.sendConfig() }
                         AppPrefs.setUsageReportingDialogAnswered(preferences)
                     }
 
                     UsageReportingChoice.DENY -> {
                         api?.setUsageReporting(false)
-                        api?.sendConfig()
+                        scope.launch { api?.sendConfig() }
                         AppPrefs.setUsageReportingDialogAnswered(preferences)
                     }
 
@@ -210,24 +211,25 @@ private inline fun <reified T : MainTabRoute> rememberMainTabBackStack(initial: 
 }
 
 @Composable
-private inline fun <reified T : MainTabRoute> tabEntries(
+private fun <T : MainTabRoute> tabEntries(
     backStack: NavBackStack<T>,
     initial: T,
-    noinline content: @Composable () -> Unit,
+    content: @Composable () -> Unit,
 ): List<NavEntry<MainTabRoute>> {
     if (backStack.isEmpty()) {
         backStack.add(initial)
     }
-    val decorators = listOf(rememberSaveableStateHolderNavEntryDecorator<T>())
-    val provider = entryProvider<T> {
-        entry<T> { content() }
+    val decorators = listOf(rememberSaveableStateHolderNavEntryDecorator<MainTabRoute>())
+    // Register by key value, not by `entry<MainTabRoute>`: Nav3 resolves class providers on an
+    // exact `key::class` match, so the sealed interface would never match a concrete tab route.
+    val provider = entryProvider<MainTabRoute> {
+        entry(initial) { content() }
     }
-    @Suppress("UNCHECKED_CAST")
-    return rememberDecoratedNavEntries(
+    return rememberDecoratedNavEntries<MainTabRoute>(
         backStack = backStack,
         entryDecorators = decorators,
         entryProvider = provider,
-    ) as List<NavEntry<MainTabRoute>>
+    )
 }
 
 @OptIn(ExperimentalMaterial3Api::class)

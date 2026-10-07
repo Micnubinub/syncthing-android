@@ -1,6 +1,7 @@
 package com.micnubinub.syncthing.util
 
 import android.util.Base64
+import com.micnubinub.syncthing.util.CertificateValidator.keyCheck
 import java.io.ByteArrayInputStream
 import java.security.KeyFactory
 import java.security.PrivateKey
@@ -131,6 +132,20 @@ object CertificateValidator {
         parseChain(certBytes).firstOrNull()?.let { certInfo(it) }
     } catch (e: Exception) {
         null
+    }
+
+    /**
+     * Runs only the private-key/certificate match of [keyCheck], for callers that have to
+     * know whether a key belongs to a certificate before installing the pair.
+     *
+     * [Status.WARN] means the key could not be decoded here (encrypted, PKCS#1 or SEC1),
+     * which is not a mismatch: the Syncthing core is the authority on those, and it loads
+     * the pair itself.
+     */
+    fun keyBelongsToCertificate(certBytes: ByteArray, keyBytes: ByteArray): Status = try {
+        keyCheck(keyBytes, parseChain(certBytes).first()).status
+    } catch (e: Exception) {
+        Status.WARN
     }
 
     // --- individual checks ---------------------------------------------------------------------
@@ -314,7 +329,7 @@ object CertificateValidator {
         val end = "-----END $kind-----"
         val b = text.indexOf(begin)
         val e = text.indexOf(end)
-        require(b >= 0 && e > b) { "PEM block not found" }
+        require(b in 0..<e) { "PEM block not found" }
         val body = text.substring(b + begin.length, e).replace("\\s".toRegex(), "")
         return Base64.decode(body, Base64.DEFAULT)
     }

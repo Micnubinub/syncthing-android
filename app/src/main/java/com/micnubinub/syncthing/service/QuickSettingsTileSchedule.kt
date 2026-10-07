@@ -6,17 +6,15 @@ import android.content.Intent
 import android.content.ServiceConnection
 import android.content.SharedPreferences
 import android.content.SharedPreferences.OnSharedPreferenceChangeListener
-import android.os.Build
 import android.os.IBinder
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
 import android.util.Log
-import androidx.annotation.RequiresApi
 import androidx.preference.PreferenceManager
 import com.micnubinub.syncthing.R
 import com.micnubinub.syncthing.service.SyncthingService.OnServiceStateChangeListener
 
-@RequiresApi(api = Build.VERSION_CODES.N)
+
 class QuickSettingsTileSchedule : TileService(), ServiceConnection, OnServiceStateChangeListener {
     private var tilesAvailableState = Tile.STATE_INACTIVE
     private var context: Context? = null
