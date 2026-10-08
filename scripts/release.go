@@ -41,10 +41,14 @@ func main() {
 		utils.Fail("Working tree has uncommitted changes. Commit or stash first.")
 	}
 
-	existing := utils.RunGit([]string{"tag", "-l", version}, true)
-	if existing != "" {
-		utils.Fail("Tag %s already exists.", version)
-	}
+    if !strings.HasPrefix(version, "v") {
+        version = "v" + version
+    }
+
+    existing := utils.RunGit([]string{"tag", "-l", version}, true)
+    if strings.TrimSpace(existing) != "" {
+        utils.Fail("Tag %s already exists.", version)
+    }
 
 	utils.RunGit([]string{"tag", "-a", version, "-m", message, "-m", changelog}, false)
 	utils.RunGit([]string{"push", "origin", version}, false)
