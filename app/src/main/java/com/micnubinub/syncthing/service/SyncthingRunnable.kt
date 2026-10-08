@@ -23,6 +23,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.BufferedReader
@@ -228,7 +229,7 @@ class SyncthingRunnable(
             // Check for quick crash then wait for the process to exit naturally.
             // Short-lived commands (deviceid, generate, resetdatabase) should finish
             // within the timeout. Long-running commands (main, resetdeltas) will keep
-            // running until told to stop via api.shutdown() / killProcess().
+            // running until told to stop via api.postShutdownRequest() / killProcess().
             val isLongRunningCommand = isServiceGeneration
             exitCode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 when {
@@ -459,6 +460,10 @@ class SyncthingRunnable(
     /**
      * Polls [process] until it exits or [timeoutMs] has passed, destroying it in the
      * latter case. Used where the platform has no `waitFor(timeout)`.
+     *
+     * Runs on the dedicated Syncthing process thread ([run]), which has no coroutine
+     * context, so the poll blocks that worker thread with `Thread.sleep` by design;
+     * there is no [delay] to suspend on.
      *
      * @return the exit code, or [EXIT_FORCE_KILL] when the process had to be destroyed.
      */
@@ -801,11 +806,15 @@ class SyncthingRunnable(
      * shutdown flushes the database and closes connections, and signalling the
      * process first would abort it part-way through.
      *
+     * Suspending between polls instead of sleeping: every caller runs under
+     * `withContext(Dispatchers.IO)`, so [delay] frees the dispatcher thread while
+     * the process winds down.
+     *
      * @return true if the process is no longer running when this returns (including
      * when this runnable never owned one), false if it was still running after
      * [timeoutMs] and the caller has to force it.
      */
-    fun awaitProcessExit(timeoutMs: Long): Boolean {
+    suspend fun awaitProcessExit(timeoutMs: Long): Boolean {
         val process = syncthing.get() ?: return true
         val deadline = SystemClock.elapsedRealtime() + timeoutMs
         while (true) {
@@ -821,12 +830,7 @@ class SyncthingRunnable(
             if (SystemClock.elapsedRealtime() >= deadline) {
                 return false
             }
-            try {
-                Thread.sleep(PROCESS_EXIT_POLL_INTERVAL_MS)
-            } catch (e: InterruptedException) {
-                Thread.currentThread().interrupt()
-                return false
-            }
+            delay(PROCESS_EXIT_POLL_INTERVAL_MS)
         }
     }
 

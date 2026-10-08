@@ -61,6 +61,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.BufferOverflow
@@ -124,6 +125,13 @@ class RestApi(
      */
     private val startupResults =
         EnumMap<StartupSnapshot, Boolean>(StartupSnapshot::class.java)
+
+    /**
+     * Deadline timer of the current handshake, guarded by [asyncQueryCompleteLock].
+     * Cancelled as soon as the handshake settles so it cannot fail a startup that
+     * already succeeded.
+     */
+    private var startupDeadlineJob: Job? = null
 
     /**
      * The three snapshots that make up a startup handshake, see [readConfigFromRestApi].
@@ -296,10 +304,11 @@ class RestApi(
                 startupGeneration++
                 generation = startupGeneration
                 startupResults.clear()
-            }
-            scope.launch {
-                delay(STARTUP_SNAPSHOT_DEADLINE_MS.milliseconds)
-                failStartup(generation, "Startup snapshots did not all report in time")
+                startupDeadlineJob?.cancel()
+                startupDeadlineJob = scope.launch {
+                    delay(STARTUP_SNAPSHOT_DEADLINE_MS.milliseconds)
+                    failStartup(generation, "Startup snapshots did not all report in time")
+                }
             }
             GetRequest(
                 context,
@@ -376,15 +385,27 @@ class RestApi(
                 )
                 return
             }
+            if (StartupSnapshot.entries.all { startupResults.containsKey(it) }) {
+                // The handshake already settled - the deadline fired first - so a late
+                // result must neither overwrite it nor activate the core.
+                Log.w(TAG, "completeStartupSnapshot: ignoring $snapshot for settled handshake")
+                return
+            }
             startupResults[snapshot] = succeeded
             allReported = StartupSnapshot.entries.all { startupResults.containsKey(it) }
             allSucceeded = StartupSnapshot.entries.all { startupResults[it] == true }
+            if (allReported) {
+                // The handshake settled, so the deadline timer can no longer fire against it.
+                startupDeadlineJob?.cancel()
+                startupDeadlineJob = null
+            }
         }
         if (!allReported) {
             return
         }
         if (!allSucceeded) {
-            failStartup(generation, "Not all startup snapshots could be read")
+            Log.e(TAG, "readConfigFromRestApi: Not all startup snapshots could be read")
+            onStartupFailedListener("Not all startup snapshots could be read")
             return
         }
         LogV("Reading config from REST completed. Syncthing version is $version")
@@ -399,18 +420,25 @@ class RestApi(
     }
 
     /**
-     * Fails the startup handshake of [generation], telling the service to terminate what
-     * it owns. A generation that already reported is left alone, so the success path is
-     * never undone.
+     * Fails the startup handshake of [generation] if it is still in flight, telling the
+     * service to terminate what it owns. A generation that is no longer current or whose
+     * handshake already settled is left alone, so the success path is never undone and
+     * [onStartupFailedListener] fires at most once per generation.
      */
     private fun failStartup(generation: Long, reason: String) {
         synchronized(asyncQueryCompleteLock) {
             if (generation != startupGeneration) {
                 return
             }
+            if (StartupSnapshot.entries.all { startupResults.containsKey(it) }) {
+                // Every snapshot already reported, so the handshake settled - either it
+                // succeeded or it was already failed. Never report twice.
+                return
+            }
             // Mark every snapshot as reported so a late result cannot activate the core
             // after this point.
             StartupSnapshot.entries.forEach { startupResults.putIfAbsent(it, false) }
+            startupDeadlineJob = null
         }
         Log.e(TAG, "readConfigFromRestApi: $reason")
         onStartupFailedListener(reason)
@@ -1044,10 +1072,12 @@ class RestApi(
     }
 
     /**
-     * Posts shutdown request.
-     * This will cause SyncthingNative to exit and not restart.
+     * Stops everything this RestApi owns locally: event stream, coroutine scopes and
+     * queued config saves. Runs on every teardown, including while the core is still
+     * starting, so no scope outlives the service. The shutdown POST is separate
+     * ([postShutdownRequest]) because it needs a serving Web GUI to answer.
      */
-    suspend fun shutdown() {
+    fun stopLocalWork() {
         hasShutdown = true
         stopEventStream()
         scope.cancel()
@@ -1063,7 +1093,14 @@ class RestApi(
         configSaveScope.cancel()
         pendingConfigSaves.forEach { it.complete(ConfigSaveResult.SKIPPED) }
         pendingConfigSaves.clear()
+    }
 
+    /**
+     * Posts shutdown request.
+     * This will cause SyncthingNative to exit and not restart.
+     * Only meaningful while the Web GUI serves, i.e. not during startup.
+     */
+    suspend fun postShutdownRequest() {
         // Bounded: a wedged core must not hold the caller here indefinitely. The
         // caller force-terminates the process on timeout, so a missing request is
         // recoverable.
@@ -1876,7 +1913,7 @@ class RestApi(
         }
     }
 
-    fun onFolderSyncCompleted(
+    suspend fun onFolderSyncCompleted(
         folder: Folder,
         folderState: String?,
         deviceId: String?

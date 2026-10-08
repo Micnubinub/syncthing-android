@@ -14,6 +14,7 @@ import com.micnubinub.syncthing.model.Folder
 import com.micnubinub.syncthing.service.Constants
 import com.micnubinub.syncthing.util.Util.PROCESS_DESTROYED_EXIT_CODE
 import com.micnubinub.syncthing.util.Util.waitForOrDestroy
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -30,6 +31,7 @@ import java.time.ZoneId
 import java.time.ZoneOffset
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
+import java.util.Date
 import java.util.Locale
 import javax.net.ssl.TrustManagerFactory
 import javax.net.ssl.X509TrustManager
@@ -223,6 +225,8 @@ object Util {
                 }
             }
             exitCode = waitForOrDestroy(process, "runCommand")
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             Log.w(TAG, "runCommand: Exception", e)
         } finally {
@@ -267,11 +271,14 @@ object Util {
      * Waits for [process] to exit, destroying it if it outlasts the deadline.
      *
      * Polls rather than using [Process.waitFor] with a timeout, which API 24-25 lack.
+     * Suspending with [delay] instead of sleeping keeps the caller's `Dispatchers.IO`
+     * thread free while the process winds down; every caller is already a suspend
+     * function running under that dispatcher.
      *
      * @return the exit code, or [PROCESS_DESTROYED_EXIT_CODE] when the process had to be
      * destroyed.
      */
-    private fun waitForOrDestroy(process: Process, caller: String): Int {
+    private suspend fun waitForOrDestroy(process: Process, caller: String): Int {
         val deadline = SystemClock.elapsedRealtime() + PROCESS_EXIT_TIMEOUT_MS
         while (true) {
             try {
@@ -286,12 +293,7 @@ object Util {
                     process.destroy()
                     return PROCESS_DESTROYED_EXIT_CODE
                 }
-                try {
-                    Thread.sleep(PROCESS_EXIT_POLL_INTERVAL_MS)
-                } catch (interrupted: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                    return PROCESS_DESTROYED_EXIT_CODE
-                }
+                delay(PROCESS_EXIT_POLL_INTERVAL_MS.milliseconds)
             }
         }
     }
@@ -300,7 +302,7 @@ object Util {
      * Run a command via ProcessBuilder with list arguments and return its stdout.
      * Avoids shell interpretation of arguments, preventing command injection.
      */
-    private fun runProcessBuilderGetOutput(command: List<String>, workDir: File? = null): String {
+    private suspend fun runProcessBuilderGetOutput(command: List<String>, workDir: File? = null): String {
         val capturedStdOut = StringBuilder()
         var process: Process? = null
         try {
@@ -319,6 +321,8 @@ object Util {
                 }
             }
             waitForOrDestroy(process, "runProcessBuilderGetOutput")
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             Log.w(TAG, "runProcessBuilderGetOutput: Exception", e)
         } finally {
@@ -480,9 +484,7 @@ object Util {
             return dateTime
         }
 
-        val parsedDateTime = ZonedDateTime.parse(dateTime)
-        val zonedDateTime = parsedDateTime.withZoneSameInstant(ZoneId.systemDefault())
-        return dateTimeFormatter.format(zonedDateTime)
+        return dateTimeFormatter.format(Date.from(ZonedDateTime.parse(dateTime).toInstant()))
     }
 
 
@@ -492,9 +494,7 @@ object Util {
             return dateTime
         }
 
-        val parsedDateTime = ZonedDateTime.parse(dateTime)
-        val zonedDateTime = parsedDateTime.withZoneSameInstant(ZoneId.systemDefault())
-        return timeFormatter.format(zonedDateTime)
+        return timeFormatter.format(Date.from(ZonedDateTime.parse(dateTime).toInstant()))
     }
 
     @JvmStatic
@@ -517,7 +517,7 @@ object Util {
     /**
      * Called by RestApi/setRemoteCompletionInfo after folder completed.
      */
-    fun runScriptSet(absPath: String, scriptArgs: Array<String>?) {
+    suspend fun runScriptSet(absPath: String, scriptArgs: Array<String>?) {
         val scriptFolder = File(absPath)
         if (!scriptFolder.exists() || !scriptFolder.isDirectory) {
             Log.w(TAG, "runScriptSet: Folder does not exist or is not of type folder: $absPath")
@@ -544,7 +544,7 @@ object Util {
      * Called by RestApi/setRemoteCompletionInfo after folder completed.
      */
     @JvmStatic
-    fun getSyncConflictFiles(absPath: String?): List<String> {
+    suspend fun getSyncConflictFiles(absPath: String?): List<String> {
         if (absPath.isNullOrEmpty()) {
             return listOf()
         }

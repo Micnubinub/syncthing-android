@@ -765,7 +765,6 @@ class SyncthingService : Service() {
      */
     private fun onApiUnavailable(reason: String) {
         Log.e(TAG, "onApiUnavailable: $reason")
-        notificationHandler.showCrashedNotification(R.string.notification_crash_title, reason)
         synchronized(stateLock) {
             if (currentState != State.STARTING) {
                 Log.e(
@@ -776,6 +775,7 @@ class SyncthingService : Service() {
             }
             onServiceStateChange(State.ERROR)
         }
+        notificationHandler.showCrashedNotification(R.string.notification_crash_title, reason)
         shutdownScope.launch { shutdown(State.DISABLED) }
     }
 
@@ -880,9 +880,13 @@ class SyncthingService : Service() {
         syncthingRunnable?.markShutdownRequested()
 
         // Stop and clear the API only when this service created one, so a leftover
-        // reference can never outlive the core it belongs to.
+        // reference can never outlive the core it belongs to. The local work (scopes,
+        // event stream, queued saves) always stops; only the shutdown POST is skipped
+        // while STARTING because the Web GUI does not serve yet and the owned process
+        // is force-killed below instead.
+        api?.stopLocalWork()
         if (!wasStarting) {
-            api?.shutdown()
+            api?.postShutdownRequest()
         }
         api = null
 
