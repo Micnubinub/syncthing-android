@@ -119,13 +119,6 @@ rg -n 'exported|permission|foregroundServiceType|allowBackup|usesCleartextTraffi
 
 Append to the generated file, in order:
 
-1. **Scope:** revision and dirty state; inspected modules/files; variants; toolchain; areas marked
-   Inspected / Not applicable / Not inspected with reasons; assumptions.
-2. **Findings**, ordered by risk (format above).
-3. **Verification status:** per check, the command, result (Executed | Cached | Skipped | Failed |
-   Not run), exit status, and limitation. Separate environment failures from app failures.
-4. **Sign-off:** **Blocked** (unresolved Blocking finding), **Inconclusive** (essential scope or
-   evidence unavailable), **Conditional** (runtime verification or decisions remain), or
-   **Verified within scope**. If no defect is established, write
-   **"No confirmed findings within the inspected scope."** and list unresolved candidates
-   separately. Do not invent findings to fill the report.
+1. **Findings**, ordered by risk (format above).
+2. **Sign-off:** **Blocked** (unresolved Blocking finding), **Inconclusive** (essential scope or
+   evidence unavailable), **Conditional** (runtime verification or decisions remain)

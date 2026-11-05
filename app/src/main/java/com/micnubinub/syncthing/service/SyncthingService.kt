@@ -233,7 +233,17 @@ class SyncthingService : Service() {
             return START_STICKY
         }
 
-        if (ACTION_RESTART == intent.action && synchronized(stateLock) { currentState == State.ACTIVE }) {
+        /**
+         * A core-requested restart can arrive before the Web GUI came up, i.e. while still
+         * [State.STARTING]. Ignoring it there would leave the service waiting for a startup
+         * that has already ended, with no retry. [State.INIT] is included for a request that
+         * races the teardown of a previous restart. Either way, stop the generation this
+         * service owns and launch a fresh one.
+         */
+        if (ACTION_RESTART == intent.action && synchronized(stateLock) {
+                currentState == State.ACTIVE || currentState == State.STARTING ||
+                        currentState == State.INIT
+            }) {
             shutdownScope.launch {
                 shutdown(State.INIT)
                 launchStartupTask(SyncthingRunnable.Command.main)
