@@ -17,9 +17,7 @@ order:
 
 1. Google Play Store
 2. Samsung Galaxy Store
-3. Xiaomi GetApps
-4. OPPO App Market
-5. Other smaller app stores as time permits
+3. Other smaller app stores as time permits
 
 APKs are always available from the [Releases](../../releases) section regardless of store
 availability.
@@ -60,8 +58,7 @@ availability.
   - `updateSyncthing.go`: checks for new Syncthing releases, bumps `version-name` and
     `version-code` in `libs.versions.toml`, and re-vendors the sources
   - `release.go`: creates an annotated git tag and pushes it to origin
-- ProGuard/R8 enabled with minification, resource shrinking and log stripping (roughly 50%
-  smaller app)
+- ProGuard/R8 enabled with minification, resource shrinking and log stripping
 - minSdk raised from 23 to 24, targetSdk raised from 36 to 37
 - ABI splits enabled for APK builds, automatically disabled for AppBundle builds
 - CI: reusable workflows and automated run cleanup
