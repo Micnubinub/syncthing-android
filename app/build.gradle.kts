@@ -69,7 +69,8 @@ val keyAlias = propOrEnv("KEY_ALIAS")
 val keyPassword = propOrEnv("KEY_PASSWORD")
 
 android {
-    compileSdk = libs.versions.compile.sdk.get().toInt()
+    compileSdk = libs.versions.compile.sdk.asProvider().get().toInt()
+    compileSdkMinor = libs.versions.compile.sdk.minor.get().toInt()
     buildToolsVersion = "37.0.0"
     namespace = "com.micnubinub.syncthing"
     ndkVersion = libs.versions.ndk.version.get()
