@@ -1,6 +1,5 @@
 package com.micnubinub.syncthing.service
 
-import android.content.Context
 import android.content.Intent
 import android.os.Trace
 import android.util.Log
@@ -89,7 +88,7 @@ import kotlin.time.Duration.Companion.milliseconds
  * Provides functions to interact with the syncthing REST API.
  */
 class RestApi(
-    private val context: Context,
+    private val context: SyncthingService,
     /**
      * Written by the config-save consumer when a new config moved the Web GUI, and read by
      * every request that follows, which runs on other threads.
@@ -144,12 +143,14 @@ class RestApi(
     private val configLock = Any()
 
     /**
-     * One config snapshot waiting to be delivered to the core, plus the result the
-     * waiter is suspended on.
+     * One config write waiting to be delivered to the core, plus the result the waiter is
+     * suspended on. Either a full config snapshot or, with [patchPath], a PATCH of the
+     * fields in [body] of a single folder or device.
      */
     private class PendingConfigSave(
-        val jsonConfig: String,
-        val completion: CompletableDeferred<ConfigSaveResult>
+        val body: String,
+        val completion: CompletableDeferred<ConfigSaveResult>,
+        val patchPath: String? = null
     )
 
     /**
@@ -513,35 +514,46 @@ class RestApi(
             return
         }
 
-        var changed = false
         synchronized(configLock) {
             config?.folders?.forEach { folder ->
                 folder.id?.let { id ->
                     restoreMap[id]?.let { cleanupIntervalS ->
-                        if (folder.versioning?.cleanupIntervalS != cleanupIntervalS) {
-                            folder.versioning?.cleanupIntervalS = cleanupIntervalS
-                            changed = true
+                        folder.versioning?.let { versioning ->
+                            if (versioning.cleanupIntervalS != cleanupIntervalS) {
+                                versioning.cleanupIntervalS = cleanupIntervalS
+                                LogV("Restored VersioningCleanupIntervalS of folder $id")
+                                queueFolderVersioningPatchLocked(id, versioning)
+                            }
                         }
                     }
                 }
-            }
-            if (changed) {
-                LogV("Restored VersioningCleanupIntervalS to the user's original values")
-                queueConfigSave()
             }
         }
         sharedPreferences.edit { remove(Constants.PREF_VERSIONING_CLEANUP_RESTORE) }
     }
 
-    fun reloadConfig() {
+    /**
+     * Replaces the cached config with the core's.
+     *
+     * @param onFailed told when the config could not be fetched or parsed, so the cache is
+     * still behind the core.
+     */
+    fun reloadConfig(onFailed: (() -> Unit)? = null) {
         GetRequest(
             context,
             url,
             GetRequest.URI_CONFIG,
             apiKey,
             null,
-            { configResult: String? -> onReloadConfigComplete(configResult) },
-            null
+            { configResult: String? ->
+                onReloadConfigComplete(configResult) { loaded ->
+                    if (!loaded) onFailed?.invoke()
+                }
+            },
+            { error ->
+                Log.w(TAG, "reloadConfig: Failed to fetch the config: $error")
+                onFailed?.invoke()
+            }
         )
     }
 
@@ -601,8 +613,12 @@ class RestApi(
                     val entries = jsonObject.entrySet()
                     for ((key, value) in entries) {
                         val resultDeviceId = key ?: continue
-                        val pendingDevice =
+                        val pendingDevice = try {
                             gson.fromJson(value, PendingDevice::class.java)
+                        } catch (e: Exception) {
+                            Log.e(TAG, "ORCC: URI_PENDING_DEVICES, failed to parse an entry", e)
+                            null
+                        } ?: continue
                         Log.d(
                             TAG,
                             "ORCC: resultDeviceId = " + resultDeviceId + "('" + pendingDevice.name + "')"
@@ -637,10 +653,14 @@ class RestApi(
                                 "device" to device.deviceID,
                                 "folder" to folder.id
                             ),
-                            { result: String? ->
+                            OnSuccessListener { result: String? ->
                                 try {
-                                    val completionInfo =
+                                    val completionInfo = try {
                                         gson.fromJson(result, CompletionInfo::class.java)
+                                    } catch (e: Exception) {
+                                        Log.e(TAG, "ORCC: /rest/db/completion: Failed to parse result", e)
+                                        null
+                                    } ?: return@OnSuccessListener
                                     LogV(
                                         "ORCC: /rest/db/completion: folder=" + folder.id +
                                                 ", device=" + device.displayName +
@@ -698,15 +718,16 @@ class RestApi(
                 for (folderEntry in entries) {
                     val resultFolderId = folderEntry.key ?: continue
                     val jsonObjectOfferedBy =
-                        folderEntry.value?.getAsJsonObject()?.get("offeredBy")
-                            ?.getAsJsonObject()
+                        (folderEntry.value as? JsonObject)?.get("offeredBy") as? JsonObject
                     jsonObjectOfferedBy?.entrySet()?.let { mapEntries ->
                         for (offeredByEntry in mapEntries) {
                             val offeredByDeviceId = offeredByEntry.key ?: continue
-                            val pendingFolder = gson.fromJson(
-                                offeredByEntry.value,
-                                PendingFolder::class.java
-                            )
+                            val pendingFolder = try {
+                                gson.fromJson(offeredByEntry.value, PendingFolder::class.java)
+                            } catch (e: Exception) {
+                                Log.e(TAG, "ORCC: URI_PENDING_FOLDERS, failed to parse an entry", e)
+                                null
+                            } ?: continue
                             Log.d(
                                 TAG,
                                 "ORCC: resultFolderId = " + resultFolderId + "('" + pendingFolder.label + "')"
@@ -1009,26 +1030,31 @@ class RestApi(
      *
      * Call this with [configLock] held.
      */
-    private fun queueConfigSaveLocked(): CompletableDeferred<ConfigSaveResult> {
-        val completion = CompletableDeferred<ConfigSaveResult>()
-        val queued = configSaveQueue.trySend(PendingConfigSave(gson.toJson(config), completion))
-        if (queued.isFailure) {
-            // The queue is closed, i.e. the core is shutting down.
-            completion.complete(ConfigSaveResult.SKIPPED)
-        } else {
-            pendingConfigSaves.add(completion)
-        }
-        return completion
-    }
+    private fun queueConfigSaveLocked(): CompletableDeferred<ConfigSaveResult> =
+        enqueueConfigWriteLocked(PendingConfigSave(gson.toJson(config), CompletableDeferred()))
 
     /**
-     * For internal mutations whose outcome nobody reports. The reload still only happens
-     * once the core has accepted the write.
+     * Queues a PATCH of only the fields in [fields] of the config object at [path], for
+     * automatic writes whose outcome nobody reports. Unlike a full snapshot it cannot
+     * revert anything else the core changed while the cache was behind.
+     *
+     * Call this with [configLock] held, after applying the same change to the cache.
      */
-    private fun queueConfigSave() {
-        synchronized(configLock) {
-            queueConfigSaveLocked()
+    private fun queueConfigPatchLocked(path: String, fields: Map<String, Any?>) {
+        enqueueConfigWriteLocked(
+            PendingConfigSave(gson.toJson(fields), CompletableDeferred(), patchPath = path)
+        )
+    }
+
+    private fun enqueueConfigWriteLocked(save: PendingConfigSave): CompletableDeferred<ConfigSaveResult> {
+        val queued = configSaveQueue.trySend(save)
+        if (queued.isFailure) {
+            // The queue is closed, i.e. the core is shutting down.
+            save.completion.complete(ConfigSaveResult.SKIPPED)
+        } else {
+            pendingConfigSaves.add(save.completion)
         }
+        return save.completion
     }
 
     /**
@@ -1049,9 +1075,11 @@ class RestApi(
         if (hasShutdown) {
             return ConfigSaveResult.SKIPPED
         }
-        val result = PostRequest.postAndAwait(
+        val result = save.patchPath?.let { path ->
+            PostRequest.patchAndAwait(context, url, path, apiKey, save.body)
+        } ?: PostRequest.postAndAwait(
             context, url, PostRequest.URI_SYSTEM_CONFIG, apiKey,
-            postBody = save.jsonConfig
+            postBody = save.body
         )
         return when (result) {
             is ApiRequest.ApiResult.Success -> {
@@ -1066,6 +1094,11 @@ class RestApi(
                     TAG,
                     "deliverConfigSave: Syncthing did not accept the new config: ${result.error}"
                 )
+                // The cache already carries the rejected mutation; replace it with what the
+                // core actually has, or the next unrelated save would replay it.
+                if (!hasShutdown) {
+                    reloadConfig()
+                }
                 ConfigSaveResult.FAILED
             }
         }
@@ -1112,7 +1145,7 @@ class RestApi(
     }
 
     /**
-     * Drops cached data to free memory under system memory pressure.
+     * Drops cached data after the event stream lost events.
      * All caches are repopulated lazily on the next query.
      */
     fun clearCaches() {
@@ -1133,8 +1166,11 @@ class RestApi(
         get() {
             val folders: MutableList<Folder>
             synchronized(configLock) {
-                folders =
-                    (config?.folders?.map { it.copy() } as? MutableList<Folder>) ?: mutableListOf()
+                // Copy the device list too: a shallow copy would share it with the cached
+                // config, so a caller editing shares would race readers iterating it.
+                folders = config?.folders?.mapTo(mutableListOf()) { folder ->
+                    folder.copy(devices = folder.devices.mapTo(ArrayList()) { it.copy() })
+                } ?: mutableListOf()
             }
             for (folder in folders) {
                 if (folder.path?.startsWith("~/") == true) {
@@ -1548,8 +1584,12 @@ class RestApi(
                     val entries = jsonObject.entrySet()
                     for (entry in entries) {
                         val resultDeviceId = entry.key
-                        val deviceStat =
+                        val deviceStat = try {
                             gson.fromJson(entry.value, DeviceStat::class.java)
+                        } catch (e: Exception) {
+                            Log.e(TAG, "getRemoteDeviceStatus: Failed to parse an entry", e)
+                            null
+                        } ?: continue
                         PreferenceManager.getDefaultSharedPreferences(context).edit {
                             putString(
                                 Constants.PREF_CACHE_DEVICE_LASTSEEN_PREFIX + resultDeviceId,
@@ -1676,7 +1716,7 @@ class RestApi(
                     }
                     listener.onResult(diskEvents)
                 } catch (e: Exception) {
-                    Log.e(TAG, "getDiskEvents: Parsing REST API result failed. result=$result")
+                    Log.e(TAG, "getDiskEvents: Parsing REST API result failed", e)
                     // Reporting through neither listener would leave a caller waiting for good.
                     listener.onResult(emptyList())
                 }
@@ -1740,11 +1780,13 @@ class RestApi(
                     // stale "scanning") after an event already applied the correct state.
                     val writeTime = folderStatusWriteTime[folderStatusKey(folderId)] ?: 0L
                     if (writeTime <= now) {
-                        localCompletion.setFolderStatus(
-                            folderId,
-                            folder.paused,
+                        val folderStatus = try {
                             gson.fromJson(result, FolderStatus::class.java)
-                        )
+                        } catch (e: Exception) {
+                            Log.e(TAG, "getFolderStatus: Parsing REST API result failed", e)
+                            null
+                        } ?: return@OnSuccessListener
+                        localCompletion.setFolderStatus(folderId, folder.paused, folderStatus)
                     }
                 }
             ) { }
@@ -2108,7 +2150,8 @@ class RestApi(
     fun applyCustomRunConditions(runConditionMonitor: RunConditionMonitor) {
         val sharedPreferences = PreferenceManager.getDefaultSharedPreferences(context)
         synchronized(configLock) {
-            var configChanged = false
+            // Per-object paths and the fields to PATCH there.
+            val patches = mutableListOf<Pair<String, Map<String, Any?>>>()
             // Check if the config has been loaded.
             if (config == null) {
                 Log.w(TAG, "applyCustomRunConditions: config is not ready yet.")
@@ -2127,13 +2170,17 @@ class RestApi(
                             Constants.PREF_OBJECT_PREFIX_FOLDER + folder.id
                         )
                         LogV("applyCustomRunConditions: f(" + folder.label + ")=" + (if (syncConditionsMet) "1" else "0"))
-                        if (folder.paused == syncConditionsMet) {
+                        val folderId = folder.id
+                        if (folder.paused == syncConditionsMet && folderId != null) {
                             folder.paused = !syncConditionsMet
                             Log.d(
                                 TAG,
                                 "applyCustomRunConditions: f(" + folder.label + ")=" + (if (syncConditionsMet) ">1" else ">0")
                             )
-                            configChanged = true
+                            patches.add(
+                                PostRequest.URI_CONFIG_FOLDERS + "/" + folderId to
+                                        mapOf("paused" to folder.paused)
+                            )
                         }
                     }
                 }
@@ -2157,13 +2204,17 @@ class RestApi(
                             Constants.PREF_OBJECT_PREFIX_DEVICE + device.deviceID
                         )
                         LogV("applyCustomRunConditions: d(" + device.name + ")=" + (if (syncConditionsMet) "1" else "0"))
-                        if (device.paused == syncConditionsMet) {
+                        val deviceId = device.deviceID
+                        if (device.paused == syncConditionsMet && deviceId != null) {
                             device.paused = !syncConditionsMet
                             Log.d(
                                 TAG,
                                 "applyCustomRunConditions: d(" + device.name + ")=" + (if (syncConditionsMet) ">1" else ">0")
                             )
-                            configChanged = true
+                            patches.add(
+                                PostRequest.URI_CONFIG_DEVICES + "/" + deviceId to
+                                        mapOf("paused" to device.paused)
+                            )
                         }
                     }
                 }
@@ -2173,9 +2224,9 @@ class RestApi(
                 return;
             }
 
-            if (configChanged) {
+            if (patches.isNotEmpty()) {
                 LogV("applyCustomRunConditions: Sending changed config ...")
-                queueConfigSave()
+                patches.forEach { (path, fields) -> queueConfigPatchLocked(path, fields) }
             } else {
                 LogV("applyCustomRunConditions: No action was necessary.")
             }
@@ -2186,13 +2237,28 @@ class RestApi(
         synchronized(configLock) {
             config?.folders?.let { folders ->
                 for (folder in folders) {
-                    folder.versioning?.cleanupIntervalS = cleanupIntervalS
+                    val id = folder.id ?: continue
+                    val versioning = folder.versioning ?: continue
+                    if (versioning.cleanupIntervalS != cleanupIntervalS) {
+                        versioning.cleanupIntervalS = cleanupIntervalS
+                        queueFolderVersioningPatchLocked(id, versioning)
+                    }
                 }
             }
 
             LogV("Set VersioningCleanupIntervalS to $cleanupIntervalS")
-            queueConfigSave()
         }
+    }
+
+    /**
+     * Sends the whole versioning object, because the core resets its defaulted fields
+     * before applying a partial one.
+     */
+    private fun queueFolderVersioningPatchLocked(folderId: String, versioning: Folder.Versioning) {
+        queueConfigPatchLocked(
+            PostRequest.URI_CONFIG_FOLDERS + "/" + folderId,
+            mapOf("versioning" to versioning)
+        )
     }
 
     private fun onTotalSyncCompletionChange() {
@@ -2209,7 +2275,7 @@ class RestApi(
             return
         }
         notificationHandler.updatePersistentNotification(
-            context as SyncthingService,
+            context,
             false,  // Do not persist previous notification text.
             onlineDeviceCount,
             totalSyncCompletion
@@ -2278,7 +2344,7 @@ class RestApi(
          * see [readConfigFromRestApi]. Bounded so a snapshot that never reports leaves the
          * service in ERROR rather than in STARTING for the lifetime of the process.
          */
-        private const val STARTUP_SNAPSHOT_DEADLINE_MS: Long = 60_000
+        const val STARTUP_SNAPSHOT_DEADLINE_MS: Long = 60_000
 
         /**
          * Action name suffix of the intents sent to other apps that subscribed to us.

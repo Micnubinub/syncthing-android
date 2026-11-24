@@ -9,11 +9,9 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.currentCoroutineContext
-import kotlinx.coroutines.ensureActive
-import kotlinx.coroutines.job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
+import kotlinx.coroutines.suspendCancellableCoroutine
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.Request
@@ -21,8 +19,11 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import java.io.IOException
 import java.net.MalformedURLException
+import java.net.SocketTimeoutException
 import java.net.URL
 import java.nio.charset.StandardCharsets
+import kotlin.coroutines.resume
+import kotlin.time.Duration.Companion.milliseconds
 
 abstract class ApiRequest internal constructor(
     private val context: Context?,
@@ -76,6 +77,14 @@ abstract class ApiRequest internal constructor(
         requestMethod: String, uri: Uri?, requestBody: String?,
         listener: OnSuccessListener?, errorListener: OnErrorListener?
     ) {
+        enqueue(requestMethod, uri, requestBody, listener, errorListener, attempt = 0)
+    }
+
+    private fun enqueue(
+        requestMethod: String, uri: Uri?, requestBody: String?,
+        listener: OnSuccessListener?, errorListener: OnErrorListener?,
+        attempt: Int
+    ) {
         val call = newCall(requestMethod, uri, requestBody) ?: run {
             errorListener?.onError(ApiError.Network(IOException("Failed to build request URI")))
             return
@@ -84,6 +93,35 @@ abstract class ApiRequest internal constructor(
         activeCall = call
         call.enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
+                /**
+                 * The local core occasionally stalls long enough to trip the read timeout
+                 * while it is busy (e.g. during index exchange), so give it a couple of
+                 * chances. Only idempotent GETs are retried: a timeout on a mutating request
+                 * is ambiguous, and replaying it could execute it twice. The call stays
+                 * owned and tracked during the backoff, so [cancelRequest] and
+                 * [SyncthingHttpClients.cancelInFlightCalls] still end it.
+                 */
+                if (requestMethod == "GET" && e is SocketTimeoutException &&
+                    attempt < MAX_TIMEOUT_RETRIES && !call.isCanceled()
+                ) {
+                    Log.d(TAG, "Request timed out, retry ${attempt + 1}/$MAX_TIMEOUT_RETRIES")
+                    mainScope.launch {
+                        delay(TIMEOUT_RETRY_BACKOFF_MS.milliseconds)
+                        if (call.isCanceled()) {
+                            deliverError(call, uri, errorListener, e, ApiError.Cancelled(e))
+                            return@launch
+                        }
+                        if (activeCall === call) {
+                            activeCall = null
+                        }
+                        SyncthingHttpClients.untrack(call)
+                        enqueue(
+                            requestMethod, uri, requestBody, listener, errorListener,
+                            attempt + 1
+                        )
+                    }
+                    return
+                }
                 deliverError(
                     call, uri, errorListener, e,
                     if (call.isCanceled()) ApiError.Cancelled(e) else ApiError.Network(e)
@@ -165,52 +203,54 @@ abstract class ApiRequest internal constructor(
         val call = newCall(requestMethod, uri, requestBody)
             ?: return ApiResult.Failure(ApiError.Network(IOException("Failed to build request URI")))
 
-        return withContext(Dispatchers.IO) {
-            activeCall = call
+        activeCall = call
+        try {
             /**
-             * [Call.execute] blocks and only [Call.cancel] can interrupt it, while
-             * cancelling the awaiting coroutine unwinds nothing until execute() returns.
-             * A caller that bounds this with a timeout - the shutdown POST, which runs
-             * while the core lifecycle lock is held - would therefore wait for the client's
-             * own much longer read timeout instead of its own deadline. Tying the call to
-             * this scope makes the timeout effective.
+             * The call is enqueued, not executed, so the caller is suspended rather than
+             * blocked on [Call.execute]. A blocking execute() cannot observe cancellation,
+             * so a caller that bounds this with a timeout - the shutdown POST, which runs
+             * while the core lifecycle lock is held - would wait out the client's much
+             * longer read timeout instead of its own deadline. Here cancellation resumes
+             * the caller at once and cancels the call. A result that arrives after
+             * cancellation is discarded, so a save that was abandoned mid-flight is never
+             * reported as applied.
              */
-            val cancelOnScopeEnd = currentCoroutineContext().job.invokeOnCompletion {
-                call.cancel()
-            }
-            try {
-                val result = try {
-                    call.execute().use { response ->
-                        if (!response.isSuccessful) {
-                            ApiResult.Failure(
-                                ApiError.Http(
-                                    response.code,
-                                    response.body.string(),
-                                    response.message
-                                )
-                            )
+            return suspendCancellableCoroutine { cont ->
+                cont.invokeOnCancellation { call.cancel() }
+                call.enqueue(object : Callback {
+                    override fun onFailure(call: Call, e: IOException) {
+                        if (call.isCanceled()) {
+                            cont.resume(ApiResult.Failure(ApiError.Cancelled(e)))
                         } else {
-                            ApiResult.Success(responseBodyToString(response))
+                            Log.w(TAG, "Request to $uri failed, msg=${e.message}", e)
+                            cont.resume(ApiResult.Failure(ApiError.Network(e)))
                         }
                     }
-                } catch (e: IOException) {
-                    if (call.isCanceled()) {
-                        ApiResult.Failure(ApiError.Cancelled(e))
-                    } else {
-                        Log.w(TAG, "Request to $uri failed, msg=${e.message}", e)
-                        ApiResult.Failure(ApiError.Network(e))
+
+                    override fun onResponse(call: Call, response: Response) {
+                        val result = try {
+                            response.use { resp ->
+                                if (!resp.isSuccessful) {
+                                    ApiResult.Failure(
+                                        ApiError.Http(resp.code, resp.body.string(), resp.message)
+                                    )
+                                } else {
+                                    ApiResult.Success(responseBodyToString(resp))
+                                }
+                            }
+                        } catch (e: IOException) {
+                            onFailure(call, e)
+                            return
+                        }
+                        cont.resume(result)
                     }
-                }
-                // A save that was abandoned mid-flight must not be reported as applied.
-                ensureActive()
-                result
-            } finally {
-                cancelOnScopeEnd.dispose()
-                if (activeCall === call) {
-                    activeCall = null
-                }
-                SyncthingHttpClients.untrack(call)
+                })
             }
+        } finally {
+            if (activeCall === call) {
+                activeCall = null
+            }
+            SyncthingHttpClients.untrack(call)
         }
     }
 
@@ -261,6 +301,13 @@ abstract class ApiRequest internal constructor(
          * The name of the HTTP header used for the syncthing API key.
          */
         private const val HEADER_API_KEY = "X-API-Key"
+
+        /**
+         * Retries of a GET that hit a read/write timeout, see [enqueue]. Kept small so a
+         * hung core still surfaces an error quickly.
+         */
+        private const val MAX_TIMEOUT_RETRIES = 2
+        private const val TIMEOUT_RETRY_BACKOFF_MS = 100L
 
         /**
          * Rewrites the host of the given URL to 127.0.0.1, preserving the scheme and port. The port

@@ -41,7 +41,6 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import javax.inject.Inject
-import kotlin.concurrent.thread
 
 /**
  * Runs the syncthing binary from command line, and prints its output to logcat.
@@ -70,6 +69,19 @@ class SyncthingRunnable(
     lateinit var notificationHandler: NotificationHandler
     private var ENABLE_VERBOSE_LOG = false
     private val syncthing = AtomicReference<Process>()
+
+    /**
+     * Serializes the launch in [runInternal] against [destroyProcess] and
+     * [awaitProcessExit]. A stop that arrives before the process exists has nothing to
+     * kill yet, so it sets [destroyRequested] instead, which keeps the launch from ever
+     * happening.
+     */
+    private val processLock = Any()
+
+    /**
+     * Guarded by [processLock].
+     */
+    private var destroyRequested = false
 
     /**
      * Set by the service before it asks this generation to stop, either through the
@@ -153,8 +165,6 @@ class SyncthingRunnable(
         var multicastLock: MulticastLock? = null
         var process: Process? = null
         var streamReadScope: CoroutineScope? = null
-        var stdoutReaderThread: Thread? = null
-        var stderrDrainThreadRef: Thread? = null
 
         try {
             // Android 11 blocks local discovery if we did not acquire MulticastLock.
@@ -168,16 +178,26 @@ class SyncthingRunnable(
              */
             val targetEnv = buildEnvironment()
             val startedAt = SystemClock.elapsedRealtime()
-            process = setupAndLaunch(targetEnv)
+            process = synchronized(processLock) {
+                if (destroyRequested) {
+                    null
+                } else {
+                    setupAndLaunch(targetEnv).also { syncthing.set(it) }
+                }
+            }
+            if (process == null) {
+                Log.i(TAG, "Not launching Syncthing: it was stopped before it started")
+                return ""
+            }
 
-            syncthing.set(process)
-
-            var infoJob: Job? = null
-            var warnJob: Job? = null
+            val readScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+            streamReadScope = readScope
+            val infoJob: Job
+            val warnJob: Job
             if (returnStdOut) {
-                // Drain stderr on a separate thread so a full stderr pipe cannot
+                // Drain stderr in a job of its own so a full stderr pipe cannot
                 // block the child process while stdout is read to EOF below.
-                val stderrDrainThread = thread(start = true, isDaemon = true) {
+                warnJob = readScope.launch {
                     try {
                         val errReader = process.errorStream.bufferedReader(Charset.forName("UTF-8"))
                         errReader.use {
@@ -189,11 +209,11 @@ class SyncthingRunnable(
                     }
                 }
                 /**
-                 * stdout is read on a thread of its own, not inline: a command that neither
+                 * stdout is read in a job of its own, not inline: a command that neither
                  * exits nor closes its stdout would keep an inline read blocked for good,
                  * and the bounded wait below is the only thing that ends a one-shot command.
                  */
-                stdoutReaderThread = thread(start = true, isDaemon = true) {
+                infoJob = readScope.launch {
                     try {
                         BufferedReader(
                             InputStreamReader(
@@ -213,15 +233,12 @@ class SyncthingRunnable(
                         Log.e(TAG, "Failed to read Syncthing's command line output", e)
                     }
                 }
-                stderrDrainThreadRef = stderrDrainThread
             } else {
-                streamReadScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-
-                infoJob = streamReadScope.launch {
+                infoJob = readScope.launch {
                     readStream(process.inputStream)
                 }
 
-                warnJob = streamReadScope.launch {
+                warnJob = readScope.launch {
                     readStream(process.errorStream)
                 }
             }
@@ -265,28 +282,20 @@ class SyncthingRunnable(
                     process.waitFor()
                     process.exitValue()
                 } else {
-                    awaitExitOrKill(process, PROCESS_EXIT_TIMEOUT_SECONDS * 1000L)
+                    awaitExitOrKill(process, PROCESS_EXIT_TIMEOUT_SECONDS * 1000L, readScope)
                 }
             }
             syncthing.set(null)
 
             // The readers see the pipes close once the process is gone, so they finish on
             // their own; the bound only keeps a stuck reader from holding up the caller.
-            for (readerThread in listOfNotNull(stdoutReaderThread, stderrDrainThreadRef)) {
-                readerThread.join(PROCESS_EXIT_TIMEOUT_SECONDS * 1000L)
+            val latch = CountDownLatch(2)
+            infoJob.invokeOnCompletion { latch.countDown() }
+            warnJob.invokeOnCompletion { latch.countDown() }
+            if (!latch.await(STREAM_READER_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                Log.w(TAG, "Timed out waiting for stream readers to finish")
             }
-
-            infoJob?.let {
-                // One reader job per stream: a latch sized for both would never reach
-                // zero when only one of them exists.
-                val latch = CountDownLatch(listOfNotNull(infoJob, warnJob).size)
-                infoJob.invokeOnCompletion { latch.countDown() }
-                warnJob?.invokeOnCompletion { latch.countDown() }
-                if (!latch.await(STREAM_READER_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
-                    Log.w(TAG, "Timed out waiting for stream readers to finish")
-                }
-                streamReadScope?.cancel()
-            }
+            readScope.cancel()
 
             /**
              * A core that gets to run this long has proven it can hold a generation, so the
@@ -458,34 +467,31 @@ class SyncthingRunnable(
     }
 
     /**
-     * Polls [process] until it exits or [timeoutMs] has passed, destroying it in the
-     * latter case. Used where the platform has no `waitFor(timeout)`.
+     * Waits up to [timeoutMs] for [process] to exit, destroying it otherwise. Used where
+     * the platform has no `waitFor(timeout)`.
      *
-     * Runs on the dedicated Syncthing process thread ([run]), which has no coroutine
-     * context, so the poll blocks that worker thread with `Thread.sleep` by design;
-     * there is no [delay] to suspend on.
+     * The blocking `waitFor()` runs as a job in [scope], so the caller waits on its
+     * outcome with a deadline instead of polling.
      *
      * @return the exit code, or [EXIT_FORCE_KILL] when the process had to be destroyed.
      */
-    private fun awaitExitOrKill(process: Process, timeoutMs: Long): Int {
-        val deadline = SystemClock.elapsedRealtime() + timeoutMs
-        while (true) {
-            try {
-                return process.exitValue().also {
-                    LogV("Syncthing exited with code $it")
-                }
-            } catch (e: IllegalThreadStateException) {
-                if (SystemClock.elapsedRealtime() >= deadline) {
-                    Log.w(
-                        TAG,
-                        "Syncthing did not exit within $PROCESS_EXIT_TIMEOUT_SECONDS seconds, destroying forcibly"
-                    )
-                    process.destroy()
-                    return EXIT_FORCE_KILL
-                }
-                Thread.sleep(EXIT_POLL_INTERVAL_MS)
+    private fun awaitExitOrKill(process: Process, timeoutMs: Long, scope: CoroutineScope): Int {
+        val exited = CountDownLatch(1)
+        scope.launch {
+            process.waitFor()
+            exited.countDown()
+        }
+        if (exited.await(timeoutMs, TimeUnit.MILLISECONDS)) {
+            return process.exitValue().also {
+                LogV("Syncthing exited with code $it")
             }
         }
+        Log.w(
+            TAG,
+            "Syncthing did not exit within $PROCESS_EXIT_TIMEOUT_SECONDS seconds, destroying forcibly"
+        )
+        process.destroy()
+        return EXIT_FORCE_KILL
     }
 
     private fun putCustomEnvironmentVariables(
@@ -791,7 +797,10 @@ class SyncthingRunnable(
     }
 
     fun destroyProcess() {
-        val process = syncthing.get() ?: return
+        val process = synchronized(processLock) {
+            destroyRequested = true
+            syncthing.get()
+        } ?: return
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             process.destroyForcibly()
         } else {
@@ -811,11 +820,17 @@ class SyncthingRunnable(
      * the process winds down.
      *
      * @return true if the process is no longer running when this returns (including
-     * when this runnable never owned one), false if it was still running after
+     * when this runnable never owned one, which then never launches), false if it was still running after
      * [timeoutMs] and the caller has to force it.
      */
     suspend fun awaitProcessExit(timeoutMs: Long): Boolean {
-        val process = syncthing.get() ?: return true
+        val process = synchronized(processLock) {
+            // A caller waiting for the exit must never see a process start afterwards.
+            syncthing.get() ?: run {
+                destroyRequested = true
+                null
+            }
+        } ?: return true
         val deadline = SystemClock.elapsedRealtime() + timeoutMs
         while (true) {
             val exited = try {
@@ -866,11 +881,6 @@ class SyncthingRunnable(
         private const val LOG_WRITE_BUFFER_SIZE = 64 * 1024
         private const val STREAM_READER_TIMEOUT_SECONDS: Long = 10
         private const val PROCESS_EXIT_TIMEOUT_SECONDS: Long = 10
-
-        /**
-         * Gap between two exit checks where the platform cannot wait with a deadline.
-         */
-        private const val EXIT_POLL_INTERVAL_MS: Long = 50
 
         /**
          * Poll interval used by [awaitProcessExit], which must work on API 24-25 where

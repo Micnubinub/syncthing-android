@@ -85,13 +85,10 @@ private fun WebViewActivityContent(
                 handler: SslErrorHandler?,
                 error: SslError?
             ) {
-                if (handler == null || error == null) return
-                val key = viewModel.sslExceptionKey(error)
-                if (viewModel.isSslExceptionAccepted(key)) {
-                    handler.proceed()
-                    return
-                }
-                viewModel.onAction(WebViewActivityAction.SslErrorReceived(handler, key))
+                // This screen only shows external pages (the local Web GUI has its own
+                // pinned handler), so a certificate error is never accepted. Answering at
+                // once keeps the page from waiting for good.
+                handler?.cancel()
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {

@@ -28,13 +28,24 @@ import javax.net.ssl.X509TrustManager
  */
 internal class SyncthingTrustManager(private val mHttpsCertPath: File) : X509TrustManager {
     /**
+     * A certificate parsed from [mHttpsCertPath], with the file's modification time and size
+     * at the time it was read.
+     */
+    private class PinnedCertificate(
+        val certificate: X509Certificate,
+        val lastModified: Long,
+        val length: Long
+    )
+
+    /**
      * Parsed certificate from [.mHttpsCertPath], cached so a TLS handshake does not
-     * re-read and re-parse the file from disk on every request. [SyncthingHttpClients.invalidate]
-     * rebuilds the [OkHttpClient] with a fresh [SyncthingTrustManager] whenever the certificate
-     * file changes, so the cache is always consistent with the file.
+     * re-read and re-parse the file from disk on every request. The cache is keyed on the
+     * file's modification time and size because the core rewrites the file on its own: it
+     * regenerates its self-signed certificate whenever it starts the GUI listener and the
+     * certificate has expired or expires within 30 days.
      */
     @Volatile
-    private var pinnedCertificate: X509Certificate? = null
+    private var pinnedCertificate: PinnedCertificate? = null
 
     @SuppressLint("TrustAllX509TrustManager")
     @Throws(CertificateException::class)
@@ -77,18 +88,31 @@ internal class SyncthingTrustManager(private val mHttpsCertPath: File) : X509Tru
     @Throws(CertificateException::class)
     private fun verifyAgainstPinnedCert(certs: Array<X509Certificate>) {
         try {
-            val ca = pinnedCertificate ?: FileInputStream(mHttpsCertPath).use { inputStream ->
-                val cf = CertificateFactory.getInstance("X.509")
-                (cf.generateCertificate(inputStream) as X509Certificate).also {
-                    pinnedCertificate = it
-                }
-            }
+            val ca = loadPinnedCertificate()
             for (cert in certs) {
                 cert.verify(ca.publicKey)
             }
         } catch (e: Exception) {
             throw CertificateException("Untrusted Certificate!", e)
         }
+    }
+
+    /**
+     * Returns the certificate in [mHttpsCertPath], re-reading the file only when its
+     * modification time or size changed since it was last read.
+     */
+    private fun loadPinnedCertificate(): X509Certificate {
+        val lastModified = mHttpsCertPath.lastModified()
+        val length = mHttpsCertPath.length()
+        pinnedCertificate
+            ?.takeIf { it.lastModified == lastModified && it.length == length }
+            ?.let { return it.certificate }
+        val certificate = FileInputStream(mHttpsCertPath).use { inputStream ->
+            val cf = CertificateFactory.getInstance("X.509")
+            cf.generateCertificate(inputStream) as X509Certificate
+        }
+        pinnedCertificate = PinnedCertificate(certificate, lastModified, length)
+        return certificate
     }
 
     override fun getAcceptedIssuers(): Array<X509Certificate?>? {

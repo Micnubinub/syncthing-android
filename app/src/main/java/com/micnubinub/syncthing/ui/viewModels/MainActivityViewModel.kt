@@ -15,6 +15,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.launchIn
@@ -67,9 +68,13 @@ class MainActivityViewModel : ViewModel() {
     val usageReportingDialog: StateFlow<UsageReportingDialogData?> =
         _usageReportingDialog.asStateFlow()
 
-    val api: StateFlow<RestApi?> = _service
-        .map { it?.api }
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
+    /**
+     * The service replaces its [RestApi] for every core generation, so the current one is
+     * re-read whenever the service or its state changes. Shared eagerly so [StateFlow.value]
+     * is current even without a collector.
+     */
+    val api: StateFlow<RestApi?> = combine(_service, _serviceState) { service, _ -> service?.api }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, null)
 
     fun setService(service: SyncthingService?) {
         _service.value = service
@@ -84,12 +89,13 @@ class MainActivityViewModel : ViewModel() {
     /**
      * Derives the syncing indicator from the folder-status cache, recomputed whenever
      * the RestApi pushes a folder change over its event stream (StateChanged,
-     * FolderSummary, pause/resume) instead of polling the API on an interval.
+     * FolderSummary, pause/resume) instead of polling the API on an interval. Every
+     * service state change re-evaluates it too, since the config may only now be loaded.
      */
     @OptIn(ExperimentalCoroutinesApi::class)
     private fun observeSyncStatus() {
         syncStatusJob?.cancel()
-        syncStatusJob = api.flatMapLatest { restApi ->
+        syncStatusJob = combine(api, serviceState) { restApi, _ -> restApi }.flatMapLatest { restApi ->
             if (restApi == null) {
                 flowOf(false)
             } else {

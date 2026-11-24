@@ -40,7 +40,6 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
@@ -308,8 +307,8 @@ private fun CurrentCertificateCard(info: CertificateValidator.CertInfo?) {
 @Composable
 private fun CheckRow(status: CertificateValidator.Status, title: String, detail: String?) {
     val (icon, tint) = when (status) {
-        CertificateValidator.Status.PASS -> Icons.Filled.CheckCircle to Color(0xFF2E7D32)
-        CertificateValidator.Status.WARN -> Icons.Filled.Warning to Color(0xFFF9A825)
+        CertificateValidator.Status.PASS -> Icons.Filled.CheckCircle to MaterialTheme.colorScheme.primary
+        CertificateValidator.Status.WARN -> Icons.Filled.Warning to MaterialTheme.colorScheme.tertiary
         CertificateValidator.Status.FAIL -> Icons.Filled.Error to MaterialTheme.colorScheme.error
     }
     Row(

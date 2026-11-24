@@ -53,7 +53,6 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation3.runtime.NavBackStack
 import androidx.navigation3.runtime.entryProvider
 import androidx.navigation3.ui.NavDisplay
-import androidx.preference.PreferenceManager
 import com.micnubinub.syncthing.R
 import com.micnubinub.syncthing.model.DiskEvent
 import com.micnubinub.syncthing.onboarding.OnboardingPage
@@ -815,9 +814,6 @@ private fun WebViewDestination(url: String) {
     val viewModel = viewModel<WebViewActivityViewModel>()
 
     LaunchedEffect(Unit) {
-        viewModel.setPreferences(
-            PreferenceManager.getDefaultSharedPreferences(context.applicationContext)
-        )
         viewModel.onAction(
             WebViewActivityAction.Initialize(url, Util.isRunningOnTV(context))
         )
@@ -1100,8 +1096,7 @@ private fun handleSslError(
                     handler.cancel()
                     return
                 }
-                certificate.verify(caCertificate.publicKey)
-                handler.proceed()
+                proceedIfPinned(handler, certificate, caCertificate)
             } catch (e: Exception) {
                 Log.w(TAG, e)
                 handler.cancel()
@@ -1118,10 +1113,27 @@ private fun handleSslError(
             handler.cancel()
             return
         }
-        certificate.verify(caCertificate.publicKey)
-        handler.proceed()
+        proceedIfPinned(handler, certificate, caCertificate)
     } catch (e: Exception) {
         Log.w(TAG, e)
+        handler.cancel()
+    }
+}
+
+/**
+ * Proceeds only when the served leaf carries the key of the local Web GUI certificate.
+ * A signature check against that certificate's key would reject every CA-signed leaf,
+ * since those are signed by the CA, not by themselves.
+ */
+private fun proceedIfPinned(
+    handler: SslErrorHandler,
+    certificate: X509Certificate,
+    caCertificate: X509Certificate
+) {
+    if (certificate.publicKey.encoded.contentEquals(caCertificate.publicKey.encoded)) {
+        handler.proceed()
+    } else {
+        Log.w(TAG, "Served certificate does not match the local Web GUI certificate")
         handler.cancel()
     }
 }

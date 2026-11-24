@@ -10,7 +10,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import me.zhanghai.compose.preference.MapPreferences
@@ -42,9 +45,15 @@ private fun createMutablePreferenceFlow(
      */
     val lastWritten = AtomicReference<Map<String, Any>?>(null)
 
+    /**
+     * The map the disk is known to hold. Values that arrive from the disk are recorded
+     * here before they reach [flow], so they are never taken for edits and written back.
+     * Both coroutines below run on the main thread, so no further locking is needed.
+     */
+    var previousMap: Map<String, Any> = flow.value.asMap()
+
     // Sync from Flow -> SharedPreferences
     scope.launch(Dispatchers.Main.immediate) {
-        var previousMap: Map<String, Any> = flow.value.asMap()
         // collect rather than collectLatest: a write-behind whose in-flight write is
         // cancelled leaves the disk holding neither the old nor the new value.
         flow.drop(1).collect { newPrefs ->
@@ -83,6 +92,7 @@ private fun createMutablePreferenceFlow(
             }
             val currentFlowMap = flow.value.asMap()
             if (diskMap != currentFlowMap) {
+                previousMap = diskMap
                 flow.value = MapPreferences(diskMap)
             }
         }
@@ -110,14 +120,14 @@ private fun SharedPreferences.preferenceSnapshot(): Map<String, Any> =
     all.mapNotNull { (key, value) -> value?.let { key to it } }.toMap()
 
 private fun SharedPreferences.observeChanges() = callbackFlow {
-    val listener = SharedPreferences.OnSharedPreferenceChangeListener { prefs, _ ->
-        // The listener runs on whichever thread made the change, and taking the snapshot
-        // copies the whole preference map, so it must not happen on the main thread.
-        launch(Dispatchers.IO) { trySend(prefs.preferenceSnapshot()) }
+    // The listener only signals. Snapshots are then taken one after another off the main
+    // thread, so an older snapshot can never arrive after a newer one.
+    val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
+        trySend(Unit)
     }
     registerOnSharedPreferenceChangeListener(listener)
     awaitClose { unregisterOnSharedPreferenceChangeListener(listener) }
-}
+}.conflate().map { preferenceSnapshot() }.flowOn(Dispatchers.IO)
 
 private fun SharedPreferences.Editor.putAny(key: String, value: Any?) {
     when (value) {

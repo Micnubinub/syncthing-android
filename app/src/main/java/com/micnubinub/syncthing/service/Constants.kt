@@ -100,12 +100,6 @@ object Constants {
     const val PREF_INTERNAL_INTENT_TOKEN: String = "internal_intent_token"
 
     /**
-     * Host + certificate error combinations for which the user accepted the
-     * WebView SSL security notice, persisted so they survive process death.
-     */
-    const val PREF_ACCEPTED_SSL_EXCEPTIONS: String = "accepted_ssl_exceptions"
-
-    /**
      * [ConfigXml.addSyncthingCameraFolder]
      */
     const val syncthingCameraFolderId: String = "syncthingAndroidCamera-52x89-60es4"

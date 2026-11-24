@@ -165,11 +165,11 @@ class EventsPoller internal constructor(
         val json = try {
             parseString(body)
         } catch (ex: JsonParseException) {
-            Log.w(TAG, "Skipping malformed events payload, raw=[$body]")
+            Log.w(TAG, "Skipping malformed events payload", ex)
             return
         }
         if (!json.isJsonArray) {
-            Log.w(TAG, "Events payload is not an array, raw=[$body]")
+            Log.w(TAG, "Events payload is not an array")
             return
         }
         var gapChecked = false
@@ -178,7 +178,7 @@ class EventsPoller internal constructor(
             val event = try {
                 gson.fromJson(element, Event::class.java)
             } catch (ex: JsonParseException) {
-                Log.w(TAG, "Skipping event due to JsonParseException, raw=[$element]")
+                Log.w(TAG, "Skipping event due to JsonParseException", ex)
                 continue
             }
             val id = event.id.toLong()

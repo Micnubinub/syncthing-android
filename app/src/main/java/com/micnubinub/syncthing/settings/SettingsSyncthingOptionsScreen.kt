@@ -1,7 +1,9 @@
 package com.micnubinub.syncthing.settings
 
 import android.content.ClipData
+import android.content.ClipDescription
 import android.os.Build
+import android.os.PersistableBundle
 import android.util.Log
 import android.widget.Toast
 import androidx.compose.material3.AlertDialog
@@ -187,7 +189,12 @@ fun SettingsSyncthingOptionsScreen() {
                         password()
                     },
                     onClick = {
-                        val clipData = ClipData.newPlainText(apiKeyTitle, apiKey).toClipEntry()
+                        val clipData = ClipData.newPlainText(apiKeyTitle, apiKey).apply {
+                            // Keeps the key out of clipboard previews and keyboard suggestions.
+                            description.extras = PersistableBundle().apply {
+                                putBoolean(ClipDescription.EXTRA_IS_SENSITIVE, true)
+                            }
+                        }.toClipEntry()
                         scope.launch {
                             clipboard.setClipEntry(clipData)
                             // Android 13+ shows a system confirmation automatically

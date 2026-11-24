@@ -132,6 +132,6 @@ class PollWebGuiAvailableTask(
          * How long the whole poll may take before startup is declared failed. The core is
          * a process on this device, so this only has to cover loading the database.
          */
-        private const val POLL_DEADLINE_MS: Long = 120_000
+        const val POLL_DEADLINE_MS: Long = 120_000
     }
 }

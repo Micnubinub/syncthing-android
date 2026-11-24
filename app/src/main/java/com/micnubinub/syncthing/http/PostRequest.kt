@@ -25,6 +25,8 @@ class PostRequest(
         const val URI_DB_SCAN: String = "/rest/db/scan"
         const val URI_SYSTEM_CONFIG: String = "/rest/system/config"
         const val URI_SYSTEM_SHUTDOWN: String = "/rest/system/shutdown"
+        const val URI_CONFIG_FOLDERS: String = "/rest/config/folders"
+        const val URI_CONFIG_DEVICES: String = "/rest/config/devices"
 
         /**
          * Sends a POST and suspends until Syncthing has accepted it.
@@ -45,6 +47,20 @@ class PostRequest(
             context, url, path, apiKey, safeParams(params), postBody
         ).send()
 
+        /**
+         * Sends a PATCH that changes only the fields in [body] of one config object, and
+         * suspends until Syncthing has accepted it, see [postAndAwait].
+         */
+        suspend fun patchAndAwait(
+            context: Context,
+            url: URL,
+            path: String?,
+            apiKey: String?,
+            body: String
+        ): ApiResult = AwaitedPostRequest(
+            context, url, path, apiKey, safeParams(null), body, method = "PATCH"
+        ).send()
+
         internal fun safeParams(params: MutableMap<String, String?>?): MutableMap<String, String?> =
             Optional.fromNullable(params).or(mutableMapOf())
     }
@@ -60,10 +76,11 @@ private class AwaitedPostRequest(
     path: String?,
     apiKey: String?,
     private val params: MutableMap<String, String?>,
-    private val postBody: String?
+    private val postBody: String?,
+    private val method: String = "POST"
 ) : ApiRequest(context, url, path, apiKey) {
     suspend fun send(): ApiResult = try {
-        connectAwait("POST", buildUri(params), postBody)
+        connectAwait(method, buildUri(params), postBody)
     } finally {
         // This instance never uses the callback scope, but still owns one.
         cancelRequest()

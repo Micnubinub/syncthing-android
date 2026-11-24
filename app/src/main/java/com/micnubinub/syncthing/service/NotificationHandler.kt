@@ -22,9 +22,6 @@ class NotificationHandler(
 ) {
     private val notificationManager: NotificationManager =
         context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-    private val persistentChannel: NotificationChannel?
-    private val persistentChannelWaiting: NotificationChannel?
-    private val infoChannel: NotificationChannel?
 
     private var lastNotificationText: String? = null
     private var lastStartForegroundService = false
@@ -33,7 +30,7 @@ class NotificationHandler(
     // Dagger2 constructor injection - receives SharedPreferences directly to avoid circular dependency
     init {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            persistentChannel = NotificationChannel(
+            val persistentChannel = NotificationChannel(
                 CHANNEL_PERSISTENT, context.getString(R.string.notifications_persistent_channel),
                 NotificationManager.IMPORTANCE_MIN
             )
@@ -44,7 +41,7 @@ class NotificationHandler(
             persistentChannel.lockscreenVisibility = NotificationCompat.VISIBILITY_SECRET
             notificationManager.createNotificationChannel(persistentChannel)
 
-            persistentChannelWaiting = NotificationChannel(
+            val persistentChannelWaiting = NotificationChannel(
                 CHANNEL_PERSISTENT_WAITING,
                 context.getString(R.string.notification_persistent_waiting_channel),
                 NotificationManager.IMPORTANCE_MIN
@@ -56,7 +53,7 @@ class NotificationHandler(
             persistentChannelWaiting.lockscreenVisibility = NotificationCompat.VISIBILITY_SECRET
             notificationManager.createNotificationChannel(persistentChannelWaiting)
 
-            infoChannel = NotificationChannel(
+            val infoChannel = NotificationChannel(
                 CHANNEL_INFO, context.getString(R.string.notifications_other_channel),
                 NotificationManager.IMPORTANCE_LOW
             )
@@ -64,15 +61,14 @@ class NotificationHandler(
             infoChannel.setSound(null, null)
             infoChannel.setShowBadge(true)
             notificationManager.createNotificationChannel(infoChannel)
-        } else {
-            persistentChannel = null
-            persistentChannelWaiting = null
-            infoChannel = null
         }
     }
 
-    private fun getNotificationBuilder(channel: NotificationChannel): NotificationCompat.Builder {
-        return NotificationCompat.Builder(context, channel.id)
+    /**
+     * Below API 26 there are no channels and [channelId] is ignored.
+     */
+    private fun getNotificationBuilder(channelId: String): NotificationCompat.Builder {
+        return NotificationCompat.Builder(context, channelId)
     }
 
     /**
@@ -184,45 +180,46 @@ class NotificationHandler(
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
-        (if (syncthingRunning) persistentChannel else persistentChannelWaiting)?.let {
-            val builder = getNotificationBuilder(it)
-                .setContentTitle(text)
-                .setSmallIcon(R.drawable.ic_stat_notify)
-                .setOngoing(true)
-                .setOnlyAlertOnce(true)
-                .setPriority(NotificationCompat.PRIORITY_MIN)
-                .setContentIntent(
-                    PendingIntent.getActivity(
-                        context,
-                        0,
-                        openAppIntent,
-                        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        // Built on every API level: below 26 the channel ID is simply ignored.
+        val builder = getNotificationBuilder(
+            if (syncthingRunning) CHANNEL_PERSISTENT else CHANNEL_PERSISTENT_WAITING
+        )
+            .setContentTitle(text)
+            .setSmallIcon(R.drawable.ic_stat_notify)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setPriority(NotificationCompat.PRIORITY_MIN)
+            .setContentIntent(
+                PendingIntent.getActivity(
+                    context,
+                    0,
+                    openAppIntent,
+                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                )
+            )
+            .addAction(
+                android.R.drawable.ic_menu_close_clear_cancel,
+                context.getString(R.string.exit),
+                exitPendingIntent
+            )
+        if (!appShutdownInProgress) {
+            if (startForegroundService) {
+                Log.v(TAG, "Starting foreground service or updating notification")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                    service.startForeground(
+                        idToShow,
+                        builder.build(),
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
                     )
-                )
-                .addAction(
-                    android.R.drawable.ic_menu_close_clear_cancel,
-                    context.getString(R.string.exit),
-                    exitPendingIntent
-                )
-            if (!appShutdownInProgress) {
-                if (startForegroundService) {
-                    Log.v(TAG, "Starting foreground service or updating notification")
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                        service.startForeground(
-                            idToShow,
-                            builder.build(),
-                            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-                        )
-                    } else {
-                        service.startForeground(idToShow, builder.build())
-                    }
                 } else {
-                    Log.v(TAG, "Updating notification")
-                    notificationManager.notify(idToShow, builder.build())
+                    service.startForeground(idToShow, builder.build())
                 }
             } else {
-                notificationManager.cancel(idToShow)
+                Log.v(TAG, "Updating notification")
+                notificationManager.notify(idToShow, builder.build())
             }
+        } else {
+            notificationManager.cancel(idToShow)
         }
         notificationManager.cancel(idToCancel)
         // Remember last notification visibility.
@@ -238,29 +235,27 @@ class NotificationHandler(
     }
 
     fun showCrashedNotification(@StringRes title: Int, extraInfo: String?) {
-        infoChannel?.let {
-            val intent = Intent(context, MainActivity::class.java)
-                .putExtra(MainActivity.EXTRA_SHOW_LOG, true)
-                .putExtra(
-                    MainActivity.EXTRA_INTERNAL_TOKEN,
-                    AppPrefs.getInternalIntentToken(preferences)
+        val intent = Intent(context, MainActivity::class.java)
+            .putExtra(MainActivity.EXTRA_SHOW_LOG, true)
+            .putExtra(
+                MainActivity.EXTRA_INTERNAL_TOKEN,
+                AppPrefs.getInternalIntentToken(preferences)
+            )
+        val n = getNotificationBuilder(CHANNEL_INFO)
+            .setContentTitle(context.getString(title, extraInfo))
+            .setContentText(context.getString(R.string.notification_crash_text, extraInfo))
+            .setSmallIcon(R.drawable.ic_stat_notify)
+            .setContentIntent(
+                PendingIntent.getActivity(
+                    context,
+                    ID_CRASH,
+                    intent,
+                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
                 )
-            val n = getNotificationBuilder(it)
-                .setContentTitle(context.getString(title, extraInfo))
-                .setContentText(context.getString(R.string.notification_crash_text, extraInfo))
-                .setSmallIcon(R.drawable.ic_stat_notify)
-                .setContentIntent(
-                    PendingIntent.getActivity(
-                        context,
-                        ID_CRASH,
-                        intent,
-                        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-                    )
-                )
-                .setAutoCancel(true)
-                .build()
-            notificationManager.notify(ID_CRASH, n)
-        }
+            )
+            .setAutoCancel(true)
+            .build()
+        notificationManager.notify(ID_CRASH, n)
     }
 
     /**
@@ -298,43 +293,39 @@ class NotificationHandler(
          * This is also valid if the notification does not exist.
          */
         notificationManager.cancel(notificationId)
-        infoChannel?.let {
-            val n = getNotificationBuilder(infoChannel)
-                .setContentTitle(context.getString(R.string.app_name))
-                .setContentText(text)
-                .setStyle(
-                    NotificationCompat.BigTextStyle()
-                        .bigText(text)
-                )
-                .setContentIntent(piAccept)
-                .addAction(R.drawable.ic_stat_notify, context.getString(R.string.accept), piAccept)
-                .addAction(R.drawable.ic_stat_notify, context.getString(R.string.ignore), piIgnore)
-                .setSmallIcon(R.drawable.ic_stat_notify)
-                .setAutoCancel(true)
-                .build()
-            notificationManager.notify(notificationId, n)
-        }
+        val n = getNotificationBuilder(CHANNEL_INFO)
+            .setContentTitle(context.getString(R.string.app_name))
+            .setContentText(text)
+            .setStyle(
+                NotificationCompat.BigTextStyle()
+                    .bigText(text)
+            )
+            .setContentIntent(piAccept)
+            .addAction(R.drawable.ic_stat_notify, context.getString(R.string.accept), piAccept)
+            .addAction(R.drawable.ic_stat_notify, context.getString(R.string.ignore), piIgnore)
+            .setSmallIcon(R.drawable.ic_stat_notify)
+            .setAutoCancel(true)
+            .build()
+        notificationManager.notify(notificationId, n)
     }
 
     fun showStoragePermissionRevokedNotification() {
-        infoChannel?.let {
-            val n = getNotificationBuilder(infoChannel)
-                .setContentTitle(context.getString(R.string.syncthing_terminated))
-                .setContentText(context.getString(R.string.toast_write_storage_permission_required))
-                .setSmallIcon(R.drawable.ic_stat_notify)
-                .setContentIntent(
-                    PendingIntent.getActivity(
-                        context,
-                        0,
-                        Intent(context, MainActivity::class.java),
-                        PendingIntent.FLAG_IMMUTABLE
-                    )
+        val n = getNotificationBuilder(CHANNEL_INFO)
+            .setContentTitle(context.getString(R.string.syncthing_terminated))
+            .setContentText(context.getString(R.string.toast_write_storage_permission_required))
+            .setSmallIcon(R.drawable.ic_stat_notify)
+            .setContentIntent(
+                PendingIntent.getActivity(
+                    context,
+                    0,
+                    Intent(context, MainActivity::class.java),
+                    PendingIntent.FLAG_IMMUTABLE
                 )
-                .setAutoCancel(true)
-                .setOnlyAlertOnce(true)
-                .build()
-            notificationManager.notify(ID_MISSING_PERM, n)
-        }
+            )
+            .setAutoCancel(true)
+            .setOnlyAlertOnce(true)
+            .build()
+        notificationManager.notify(ID_MISSING_PERM, n)
     }
 
     fun cancelRestartNotification() {

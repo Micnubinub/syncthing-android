@@ -7,11 +7,11 @@ import android.os.Build
 import android.os.Trace
 import android.provider.MediaStore
 import android.util.Log
-import androidx.core.util.Consumer
 import com.google.gson.GsonBuilder
 import com.google.gson.JsonArray
 import com.google.gson.JsonElement
 import com.google.gson.JsonObject
+import com.google.gson.JsonPrimitive
 import com.micnubinub.syncthing.R
 import com.micnubinub.syncthing.SyncthingApp
 import com.micnubinub.syncthing.model.Event
@@ -195,6 +195,9 @@ class EventProcessor(val context: Context, val restApi: RestApi?) {
         // Drops the cached folder/device state and its rate limiters, so the next
         // query reads authoritative values from the core again.
         api.clearCaches()
+        // A lost ConfigSaved leaves the cached config behind the core, and the next
+        // full-config save would revert whatever changed there.
+        api.reloadConfig { markStateIncomplete("config reload failed") }
         // A folder or device offer that arrived in the lost stretch was never shown.
         api.showPendingFolderNotifications()
     }
@@ -265,7 +268,7 @@ class EventProcessor(val context: Context, val restApi: RestApi?) {
         when (event.type) {
             "ConfigSaved" -> if (restApi != null) {
                 LogV("Forwarding ConfigSaved event to RestApi to get the updated config.")
-                restApi.reloadConfig()
+                restApi.reloadConfig { markStateIncomplete("config reload failed") }
             }
 
             "DeviceConnected" -> {
@@ -366,17 +369,9 @@ class EventProcessor(val context: Context, val restApi: RestApi?) {
                 onLocalIndexUpdated(json, event.data?.get("folder") as? String?, event.time)
             }
 
-            "PendingDevicesChanged" -> mapNullable<MutableMap<String, String?>?>(
-                event.data?.get("added") as? MutableList<MutableMap<String, String?>?>?,
-                Consumer { added: MutableMap<String, String?>? ->
-                    added?.let { this.onPendingDevicesChanged(it) }
-                })
+            "PendingDevicesChanged" -> pendingAdded(json).forEach { onPendingDevicesChanged(it) }
 
-            "PendingFoldersChanged" -> mapNullable<MutableMap<String, Any?>?>(
-                event.data?.get("added") as? MutableList<MutableMap<String, Any?>?>?,
-                Consumer { added: MutableMap<String, Any?>? ->
-                    added?.let { this.onPendingFoldersChanged(it) }
-                })
+            "PendingFoldersChanged" -> pendingAdded(json).forEach { onPendingFoldersChanged(it) }
 
             "Ping" -> {}
             "StateChanged" -> onStateChanged(
@@ -395,10 +390,25 @@ class EventProcessor(val context: Context, val restApi: RestApi?) {
         }
     }
 
-    private fun onPendingDevicesChanged(added: MutableMap<String, String?>) {
-        val deviceId = added["deviceID"]
-        val deviceName = added["name"]
-        val deviceAddress = added["address"]
+    /**
+     * The "added" entries of a pending devices/folders event, read from the raw JSON
+     * rather than from [Event.data], whose generic values would need unchecked casts.
+     */
+    private fun pendingAdded(json: JsonElement?): List<JsonObject> =
+        (((json as? JsonObject)?.get("data") as? JsonObject)?.get("added") as? JsonArray)
+            ?.mapNotNull { it as? JsonObject }
+            .orEmpty()
+
+    private fun JsonObject.stringOrNull(key: String): String? =
+        (get(key) as? JsonPrimitive)?.takeIf { it.isString }?.asString
+
+    private fun JsonObject.booleanOrNull(key: String): Boolean? =
+        (get(key) as? JsonPrimitive)?.takeIf { it.isBoolean }?.asBoolean
+
+    private fun onPendingDevicesChanged(added: JsonObject) {
+        val deviceId = added.stringOrNull("deviceID")
+        val deviceName = added.stringOrNull("name")
+        val deviceAddress = added.stringOrNull("address")
         if (deviceId == null) {
             return
         }
@@ -409,12 +419,12 @@ class EventProcessor(val context: Context, val restApi: RestApi?) {
         }
     }
 
-    private fun onPendingFoldersChanged(added: MutableMap<String, Any?>) {
-        val deviceId = added["deviceID"] as? String ?: ""
-        val folderId = added["folderID"] as? String ?: ""
-        val folderLabel = added["folderLabel"] as? String ?: ""
-        val receiveEncrypted = added["receiveEncrypted"] as? Boolean
-        val remoteEncrypted = added["remoteEncrypted"] as? Boolean
+    private fun onPendingFoldersChanged(added: JsonObject) {
+        val deviceId = added.stringOrNull("deviceID") ?: ""
+        val folderId = added.stringOrNull("folderID") ?: ""
+        val folderLabel = added.stringOrNull("folderLabel") ?: ""
+        val receiveEncrypted = added.booleanOrNull("receiveEncrypted")
+        val remoteEncrypted = added.booleanOrNull("remoteEncrypted")
 
         if (deviceId.isEmpty() || folderId.isEmpty()) {
             return
@@ -540,7 +550,7 @@ class EventProcessor(val context: Context, val restApi: RestApi?) {
         fullFilePath: String
     ) {
         if (!error.isNullOrEmpty()) {
-            Log.e(TAG, "onItemFinished: Error \"$error\" reported on file: $fullFilePath")
+            Log.e(TAG, "onItemFinished: Syncing a file failed")
             if (error.contains("no space left on device")) {
                 val segments: List<String> =
                     fullFilePath.split(File.separator.toRegex()).dropLastWhile { it.isEmpty() }
@@ -562,25 +572,19 @@ class EventProcessor(val context: Context, val restApi: RestApi?) {
         when (action) {
             "delete" -> {
                 if (File(fullFilePath).exists()) {
-                    Log.i(
-                        TAG,
-                        "onItemFinished: MediaStore, Skip file deletion because file exists: $fullFilePath"
-                    )
+                    Log.i(TAG, "onItemFinished: MediaStore, Skip deletion because the file exists")
                 } else {
-                    Log.i(
-                        TAG,
-                        "onItemFinished: MediaStore, Queueing file for deletion: $fullFilePath"
-                    )
+                    Log.i(TAG, "onItemFinished: MediaStore, Queueing file for deletion")
                     pendingDeleteFiles.add(fullFilePath)
                 }
             }
 
             "update" -> {
-                Log.i(TAG, "onItemFinished: MediaScanner, Queueing file for rescan: $fullFilePath")
+                Log.i(TAG, "onItemFinished: MediaScanner, Queueing file for rescan")
                 pendingScanFiles.add(fullFilePath)
             }
 
-            "metadata" -> Log.i(TAG, "onItemFinished: MediaScanner, Skipping file: $fullFilePath")
+            "metadata" -> Log.i(TAG, "onItemFinished: MediaScanner, Skipping metadata change")
             else -> Log.w(TAG, "onItemFinished: Unhandled action \"$action\"")
         }
     }
@@ -601,6 +605,10 @@ class EventProcessor(val context: Context, val restApi: RestApi?) {
                     // DISPLAY_NAME so the delete actually removes the stale MediaStore rows.
                     for (path in paths) {
                         val file = File(path)
+                        // The core may have re-created the file since it was queued.
+                        if (file.exists()) {
+                            continue
+                        }
                         val relativePath = file.parentFile?.path?.let { p ->
                             // MediaStore RELATIVE_PATH expects a trailing slash stripped path
                             // relative to the storage volume root.
@@ -623,11 +631,17 @@ class EventProcessor(val context: Context, val restApi: RestApi?) {
                     // Chunk the IN clause so a large batch never exceeds SQLite's
                     // bound-variable limit or the Binder transaction size.
                     for (chunk in paths.chunked(DELETE_BATCH_SIZE)) {
-                        val placeholders = chunk.joinToString(",") { "?" }
+                        // Below API 29 deleting the row also unlinks the file, so drop any
+                        // path the core has re-created since it was queued.
+                        val stale = chunk.filter { !File(it).exists() }
+                        if (stale.isEmpty()) {
+                            continue
+                        }
+                        val placeholders = stale.joinToString(",") { "?" }
                         val deleted = resolver.delete(
                             contentUri,
                             "${MediaStore.Images.ImageColumns.DATA} IN ($placeholders)",
-                            chunk.toTypedArray()
+                            stale.toTypedArray()
                         )
                         if (deleted >= 1) {
                             Log.v(
@@ -716,14 +730,6 @@ class EventProcessor(val context: Context, val restApi: RestApi?) {
     private fun onStateChanged(folderId: String?, newState: String?) {
         newState?.let { restApi?.updateLocalFolderState(folderId, it) }
         // LogV("onStateChanged: folder=[" + folderId + "], newState=[" + newState + "]");
-    }
-
-    private fun <T> mapNullable(l: MutableList<T?>?, c: Consumer<T?>) {
-        if (l != null) {
-            for (m in l) {
-                c.accept(m)
-            }
-        }
     }
 
     private fun LogV(logMessage: String) {
